@@ -1,7 +1,7 @@
 {
   "name": "monster-game",
-  "version": "1.3.0",
-  "description": "Monster Battler game server (PostgreSQL persistence, server-authoritative encounters)",
+  "version": "1.4.0",
+  "description": "Monster Battler game server (PostgreSQL, server-authoritative encounters + battles)",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "dependencies": {
