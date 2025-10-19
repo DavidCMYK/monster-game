@@ -1,41 +1,4 @@
-
--- Minimal schema (extend per full data dictionary)
-CREATE TABLE IF NOT EXISTS mg_players (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  email VARCHAR(255) UNIQUE,
-  handle VARCHAR(64) UNIQUE,
-  password_hash VARCHAR(255),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS mg_effects (
-  effect_id INT PRIMARY KEY,
-  code VARCHAR(64) UNIQUE NOT NULL,
-  description TEXT,
-  target ENUM('self','ally','enemy','area') NOT NULL DEFAULT 'enemy',
-  accuracy_base VARCHAR(16),
-  cost INT NOT NULL,
-  duration VARCHAR(8),
-  base_flag_eligible TINYINT(1) DEFAULT 0,
-  base_pp INT,
-  tick_source VARCHAR(16),
-  tick_percent VARCHAR(8)
-);
-
-CREATE TABLE IF NOT EXISTS mg_bonuses (
-  bonus_id INT PRIMARY KEY,
-  code VARCHAR(64) UNIQUE NOT NULL,
-  target_metric ENUM('damage','accuracy','pp','cost','element') NOT NULL,
-  value_type ENUM('percent','flat','tag') NOT NULL,
-  value VARCHAR(32) NOT NULL,
-  cost INT NOT NULL,
-  notes TEXT
-);
-
-CREATE TABLE IF NOT EXISTS mg_moves_named (
-  move_id INT PRIMARY KEY,
-  name VARCHAR(64) UNIQUE NOT NULL,
-  stack_effects VARCHAR(255),
-  stack_bonuses VARCHAR(255),
-  notes TEXT
-);
+CREATE TABLE IF NOT EXISTS mg_players ( id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) UNIQUE, handle VARCHAR(64) UNIQUE, password_hash VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP );
+CREATE TABLE IF NOT EXISTS mg_effects ( effect_id INT PRIMARY KEY, code VARCHAR(64) UNIQUE NOT NULL, description TEXT, target ENUM('self','ally','enemy','area') NOT NULL DEFAULT 'enemy', accuracy_base VARCHAR(16), cost INT NOT NULL, duration VARCHAR(8), base_flag_eligible TINYINT(1) DEFAULT 0, base_pp INT, tick_source VARCHAR(16), tick_percent VARCHAR(8) );
+CREATE TABLE IF NOT EXISTS mg_bonuses ( bonus_id INT PRIMARY KEY, code VARCHAR(64) UNIQUE NOT NULL, target_metric ENUM('damage','accuracy','pp','cost','element') NOT NULL, value_type ENUM('percent','flat','tag') NOT NULL, value VARCHAR(32) NOT NULL, cost INT NOT NULL, notes TEXT );
+CREATE TABLE IF NOT EXISTS mg_moves_named ( move_id INT PRIMARY KEY, name VARCHAR(64) UNIQUE NOT NULL, stack_effects VARCHAR(255), stack_bonuses VARCHAR(255), notes TEXT );

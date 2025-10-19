@@ -1,11 +1,9 @@
 {
   "name": "monster-game",
-  "version": "1.0.0",
-  "description": "Multiplayer web RPG game server for the Monster World project",
+  "version": "1.0.1",
+  "description": "Monster Battler game server (fixed build)",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.15.1",
