@@ -39,6 +39,7 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_sessions (
       token TEXT PRIMARY KEY,
@@ -46,6 +47,7 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_player_state (
       player_id INT PRIMARY KEY REFERENCES mg_players(id) ON DELETE CASCADE,
@@ -57,32 +59,29 @@ async function initDB() {
     );
   `);
 
-  // Species registry for spawn tables (foundation; effects/bonuses added later)
+  /* Species registry for spawn tables (foundation; effects/bonuses later) */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_species (
       id INT PRIMARY KEY,
       name TEXT NOT NULL,
       base_spawn_rate REAL NOT NULL DEFAULT 0.05,
-      // biomes a species MAY be assigned to in a chunk’s table
       biomes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-      // types per design (initial: fire, electric, air, ice, water, flora, earth, fauna)
-      types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]
+      types  TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]
     );
   `);
 
-  // Optional pre-seed if empty, matching our earlier debug trio:
+  // Optional seed if empty (matches the debug species we used)
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0) {
     await pool.query(`
       INSERT INTO mg_species (id, name, base_spawn_rate, biomes, types) VALUES
-        (1,  'Fieldling', 0.14, ARRAY['grassland','forest'], ARRAY['fauna']),
-        (2,  'Brookfin',  0.10, ARRAY['river','ocean'],      ARRAY['water']),
-        (4,  'Cliffpup',  0.08, ARRAY['mountain','grassland'], ARRAY['fauna','earth']);
+        (1, 'Fieldling', 0.14, ARRAY['grassland','forest'],     ARRAY['fauna']),
+        (2, 'Brookfin',  0.10, ARRAY['river','ocean'],          ARRAY['water']),
+        (4, 'Cliffpup',  0.08, ARRAY['mountain','grassland'],   ARRAY['fauna','earth']);
     `);
   }
-
-  // (Future) Parties/caught monsters; left out until we add battle/capture next.
 }
+
 
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
