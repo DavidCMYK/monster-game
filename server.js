@@ -3,12 +3,23 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const bodyParser = require('body-parser');
+const cors = require('cors'); // ← add this
 
 const world = require('./world');
 const Player = require('./player');
 const Monster = require('./monster');
 
 const app = express();
+
+// Allow your WP site to call this API.
+// For a quick unblock during setup, '*' is fine. You can tighten to your domain later.
+app.use(cors({
+  origin: '*', // e.g., 'https://YOUR-WORDPRESS-DOMAIN.com' when you want to lock it down
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.options('*', cors()); // ← add this (handles preflight)
+
 app.use(bodyParser.json());
 
 // In-memory demo store (replace with DB integration from db_schema.sql)
