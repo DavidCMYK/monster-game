@@ -1,3 +1,4 @@
+// world.js — deterministic, server-authoritative chunks
 const CHUNK_W = 256;
 const CHUNK_H = 256;
 
@@ -13,17 +14,16 @@ function generateChunk(cx,cy){
     tiles[y]=new Array(CHUNK_W);
     for(let x=0;x<CHUNK_W;x++){
       const biome=choose(r,pool);
-      tiles[y][x] = { biome, z: biome==='ocean'?-1:(r()<0.1?1:0), encounterRate: biome==='town'?0.01:0.08 };
+      tiles[y][x] = {
+        biome,
+        // z/variation hints (we’ll elaborate later with slopes/caves):
+        z: biome==='ocean'?-1:(r()<0.10?1:0),
+        // encounter base rate per tile (towns low per spec; indoor later = 0):
+        encounterRate: biome==='town'?0.01:0.08
+      };
     }
   }
-  const encounterTable = [
-    { speciesId: 1, baseSpawnRate: 0.14, biomes: ['grassland','forest'] },
-    { speciesId: 2, baseSpawnRate: 0.10, biomes: ['river','ocean'] },
-    { speciesId: 4, baseSpawnRate: 0.08, biomes: ['mountain','grassland'] }
-  ];
-  return { w:CHUNK_W, h:CHUNK_H, tiles, encounterTable };
+  return { w:CHUNK_W, h:CHUNK_H, tiles };
 }
 
 module.exports = { CHUNK_W, CHUNK_H, seedForChunk, generateChunk };
-
-
