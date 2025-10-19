@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monster Battler</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="mg-game-container">
+    <div class="panel" id="auth">
+      <h1>Monster Battler</h1>
+      <input id="email" placeholder="Email">
+      <input id="password" placeholder="Password" type="password">
+      <input id="handle" placeholder="Handle (register only)">
+      <div class="row">
+        <button id="btnRegister">Register</button>
+        <button id="btnLogin">Login</button>
+      </div>
+      <div id="authMsg"></div>
+    </div>
+    <canvas id="view" width="640" height="480" style="display:none;"></canvas>
+  </div>
+  <script>
+    window.MGGameConfig = window.MGGameConfig || {
+      api: (location.origin.includes('localhost')||location.origin.includes('127.0.0.1')) ? 'http://localhost:3001' : (location.origin),
+      ws: (location.origin.includes('https') ? 'wss' : 'ws') + '://' + (location.hostname) + ':3001/ws'
+    };
+  </script>
+  <script src="app.js"></script>
+</body>
+</html>
