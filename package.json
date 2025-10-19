@@ -1,7 +1,7 @@
 {
   "name": "monster-game",
   "version": "1.3.0",
-  "description": "Monster Battler vertical slice (PostgreSQL persistence)",
+  "description": "Monster Battler game server (PostgreSQL persistence, server-authoritative encounters)",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "dependencies": {
@@ -13,4 +13,3 @@
     "bcryptjs": "^2.4.3"
   }
 }
-
