@@ -1,4 +1,6 @@
-// server.js — Monster Game backend (Postgres) — 256×256 chunks + sync sequencing
+// server.js — Fast-boot Render deploys: app listens immediately; DB init runs in background.
+// Movement + endpoints match your previously working behavior (no ping-pong).
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -6,7 +8,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
-const world = require('./world'); // must export generateChunk(cx, cy) -> { w:256,h:256,tiles:[[]] }
+const world = require('./world');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -16,7 +18,8 @@ app.use(bodyParser.json());
 /* -------------------- ENV -------------------- */
 const {
   PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGPORT = 5432, PGSSLMODE = 'require',
-  PORT = 3001
+  PORT = 3001,
+  SKIP_NORMALIZE_ON_BOOT = 'false'
 } = process.env;
 
 const pool = new Pool({
@@ -25,15 +28,31 @@ const pool = new Pool({
   user: PGUSER,
   password: PGPASSWORD,
   port: Number(PGPORT),
-  ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
+  ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+  // keep connection attempts snappy so boot isn't blocked
+  connectionTimeoutMillis: 4000,
+  idleTimeoutMillis: 30000
 });
 
 /* -------------------- CONSTS -------------------- */
 const CHUNK_W = 256;
 const CHUNK_H = 256;
 
-/* -------------------- DB INIT + NORMALIZE -------------------- */
+/* -------------------- BOOT READINESS -------------------- */
+let DB_READY = false;            // flips true once tables exist
+let DB_ERROR = null;             // last init error (if any)
+
+// Gate mutating/game routes until DB is ready
+function ensureReady(req, res, next){
+  if (DB_READY) return next();
+  // allow health checks even before DB_READY
+  if (req.path === '/' || req.path === '/api/health') return next();
+  return res.status(503).json({ warming_up: true });
+}
+
+/* -------------------- DB INIT (background) -------------------- */
 async function normalizePlayerPositions() {
+  if (String(SKIP_NORMALIZE_ON_BOOT).toLowerCase() === 'true') return;
   await pool.query(`
     WITH norm AS (
       SELECT
@@ -117,6 +136,27 @@ async function initDB() {
   await normalizePlayerPositions();
 }
 
+/* Kick off DB init in the background */
+(async ()=>{
+  try{
+    await initDB();
+    DB_READY = true;
+    DB_ERROR = null;
+    console.log('✓ DB ready');
+  }catch(e){
+    DB_ERROR = String(e && e.message || e);
+    console.error('DB init failed (non-fatal boot):', e);
+    // Retry a few times in background if DB is still waking
+    let attempts = 0;
+    while (!DB_READY && attempts < 5){
+      attempts++;
+      await new Promise(r=>setTimeout(r, 3000));
+      try{ await initDB(); DB_READY = true; console.log('✓ DB ready (after retry)'); }
+      catch(err){ console.error('Retry DB init failed:', err); DB_ERROR = String(err && err.message || err); }
+    }
+  }
+})();
+
 /* -------------------- SIMPLE QUERIES -------------------- */
 async function getPlayerByEmail(email){
   const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]);
@@ -181,7 +221,7 @@ async function getParty(player_id){
 /* -------------------- ENCOUNTERS / CHUNK -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
-  const chunk = world.generateChunk(cx, cy); // w=256,h=256
+  const chunk = world.generateChunk(cx, cy);
   const counts = {};
   for (let y=0; y<chunk.h; y+=16){
     for (let x=0; x<chunk.w; x+=16){
@@ -211,14 +251,21 @@ async function buildEncounterTableForChunk(cx, cy){
 }
 
 /* -------------------- BASIC -------------------- */
-app.get('/', (req,res)=>res.type('text').send('Monster Game API online. Try /api/health'));
+// Fast health check that doesn't touch DB → lets Render mark deploy "live" immediately.
+app.get('/', (req,res)=>res.type('text').send('Monster Game API online'));
 app.get('/api/health', async (req,res)=>{
-  try { const { rows } = await pool.query('SELECT 1 AS ok'); res.json({ ok: rows[0].ok === 1 }); }
-  catch (e){ res.status(500).json({ ok:false, db_error: e.code || String(e) }); }
+  // dbReady: true when init has completed; include last error if any
+  if (!DB_READY) return res.json({ ok: true, dbReady: false, lastError: DB_ERROR });
+  try {
+    const { rows } = await pool.query('SELECT 1 AS ok');
+    res.json({ ok: rows[0].ok === 1, dbReady: true });
+  } catch (e){
+    res.status(500).json({ ok:false, dbReady: true, db_error: e.code || String(e) });
+  }
 });
 
 /* -------------------- AUTH -------------------- */
-app.post('/api/register', async (req,res)=>{
+app.post('/api/register', ensureReady, async (req,res)=>{
   try{
     const { email, password, handle } = req.body || {};
     if (!email || !password || !handle) return res.status(400).json({ error:'Missing fields' });
@@ -233,7 +280,7 @@ app.post('/api/register', async (req,res)=>{
   } catch(e){ console.error('register error', e); return res.status(500).json({ error:'server_error' }); }
 });
 
-app.post('/api/login', async (req,res)=>{
+app.post('/api/login', ensureReady, async (req,res)=>{
   try{
     const { email, password } = req.body || {};
     const p = await getPlayerByEmail(email);
@@ -259,7 +306,7 @@ async function auth(req,res,next){
 }
 
 /* -------------------- CHUNK -------------------- */
-app.get('/api/chunk', auth, async (req,res)=>{
+app.get('/api/chunk', ensureReady, auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
   const x = parseInt(req.query.x ?? st.cx, 10);
   const y = parseInt(req.query.y ?? st.cy, 10);
@@ -269,7 +316,7 @@ app.get('/api/chunk', auth, async (req,res)=>{
 });
 
 /* -------------------- MOVE (relative) -------------------- */
-app.post('/api/move', auth, async (req,res)=>{
+app.post('/api/move', ensureReady, auth, async (req,res)=>{
   const dx = Math.max(-1, Math.min(1, (req.body?.dx) || 0));
   const dy = Math.max(-1, Math.min(1, (req.body?.dy) || 0));
   const st = await getState(req.session.player_id);
@@ -291,7 +338,7 @@ app.post('/api/move', auth, async (req,res)=>{
 function worldTiles(cx, cy, tx, ty){
   return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
 }
-app.post('/api/sync', auth, async (req,res)=>{
+app.post('/api/sync', ensureReady, auth, async (req,res)=>{
   let { cx, cy, tx, ty, seq } = req.body || {};
   cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty); seq = Number(seq) || 0;
   if (!Number.isInteger(cx)||!Number.isInteger(cy)||!Number.isInteger(tx)||!Number.isInteger(ty)){
@@ -309,7 +356,6 @@ app.post('/api/sync', auth, async (req,res)=>{
   const next = worldTiles(cx, cy, tx, ty);
   const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
 
-  // Modest anti-teleport; legit play stays far below this
   if (dist > 64){
     cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
   } else {
@@ -326,11 +372,11 @@ app.post('/api/sync', auth, async (req,res)=>{
 });
 
 /* -------------------- PARTY / SPECIES -------------------- */
-app.get('/api/party', auth, async (req,res)=>{
+app.get('/api/party', ensureReady, auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
   res.json({ party });
 });
-app.get('/api/species', auth, async (req,res)=>{
+app.get('/api/species', ensureReady, auth, async (req,res)=>{
   const { rows } = await pool.query(`SELECT id, name, base_spawn_rate AS "baseSpawnRate", biomes, types FROM mg_species ORDER BY id ASC`);
   res.json({ species: rows });
 });
@@ -358,7 +404,7 @@ function levelUp(mon){
   return false;
 }
 
-app.post('/api/battle/start', auth, async (req,res)=>{
+app.post('/api/battle/start', ensureReady, auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
   const table = await buildEncounterTableForChunk(st.cx, st.cy);
 
@@ -380,7 +426,7 @@ app.post('/api/battle/start', auth, async (req,res)=>{
   res.json({ you, enemy, log: battle.log });
 });
 
-app.post('/api/battle/turn', auth, async (req,res)=>{
+app.post('/api/battle/turn', ensureReady, auth, async (req,res)=>{
   const b = battles.get(req.session.token);
   if (!b) return res.status(400).json({ error:'no_battle' });
   const action = req.body?.action;
@@ -441,6 +487,5 @@ setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate
 
 /* -------------------- BOOT -------------------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-initDB()
-  .then(()=>{ server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT)); })
-  .catch((e)=>{ console.error('DB init failed:', e); process.exit(1); });
+// LISTEN FIRST → lets Render mark the service “live” quickly
+server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT));
