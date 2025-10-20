@@ -31,6 +31,9 @@ const pool = new Pool({
 /* -------------------- CONSTS -------------------- */
 const CHUNK_W = 256;
 const CHUNK_H = 256;
+const CHUNK_CACHE_MAX = 128;
+const CHUNK_CACHE = new Map();           // key: `${cx},${cy}` -> { w,h,tiles }
+const ENCOUNTER_CACHE = new Map();       // key: `${cx},${cy}` -> encounterTable
 
 /* -------------------- DB INIT + NORMALIZE -------------------- */
 async function normalizePlayerPositions() {
@@ -228,6 +231,32 @@ async function auth(req,res,next){
 }
 
 /* -------------------- ENCOUNTERS / CHUNK -------------------- */
+
+function lruGet(map, key){ const v = map.get(key); if (v){ map.delete(key); map.set(key, v); } return v; }
+function lruSet(map, key, val, max){
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  while (map.size > max){ const k = map.keys().next().value; map.delete(k); }
+}
+
+function getChunkCached(cx, cy){
+  const k = `${cx},${cy}`;
+  const hit = lruGet(CHUNK_CACHE, k);
+  if (hit) return hit;
+  const gen = world.generateChunk(cx, cy); // deterministic + now no Math.random
+  lruSet(CHUNK_CACHE, k, gen, CHUNK_CACHE_MAX);
+  return gen;
+}
+
+async function getEncounterTableCached(cx, cy){
+  const k = `${cx},${cy}`;
+  const hit = lruGet(ENCOUNTER_CACHE, k);
+  if (hit) return hit;
+  const table = await buildEncounterTableForChunk(cx, cy);
+  lruSet(ENCOUNTER_CACHE, k, table, CHUNK_CACHE_MAX);
+  return table;
+}
+
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
   const chunk = world.generateChunk(cx, cy); // w=256,h=256
@@ -260,12 +289,13 @@ async function buildEncounterTableForChunk(cx, cy){
   return table;
 }
 
+// /api/chunk
 app.get('/api/chunk', auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
   const x = parseInt(req.query.x ?? st.cx, 10);
   const y = parseInt(req.query.y ?? st.cy, 10);
-  const chunk = world.generateChunk(x, y);
-  const encounterTable = await buildEncounterTableForChunk(x, y);
+  const chunk = getChunkCached(x, y);
+  const encounterTable = await getEncounterTableCached(x, y);
   res.json({ x, y, chunk: { ...chunk, encounterTable } });
 });
 
@@ -283,8 +313,8 @@ app.post('/api/move', auth, async (req,res)=>{
   if (ty >= CHUNK_H){ ty = 0; cy += 1; }
 
   await setState(req.session.player_id, cx, cy, tx, ty);
-  const chunk = world.generateChunk(cx, cy);
-  const encounterTable = await buildEncounterTableForChunk(cx, cy);
+  const chunk = getChunkCached(cx, cy);
+  const encounterTable = await getEncounterTableCached(cx, cy);
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
@@ -317,13 +347,9 @@ app.post('/api/sync', auth, async (req,res)=>{
     await setState(req.session.player_id, cx, cy, tx, ty);
   }
 
-  const chunk = world.generateChunk(cx, cy);
-  const encounterTable = await buildEncounterTableForChunk(cx, cy);
-  res.json({
-    seq,
-    player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) },
-    chunk: { ...chunk, encounterTable }
-  });
+  const chunk = getChunkCached(cx, cy);
+  const encounterTable = await getEncounterTableCached(cx, cy);
+  res.json({ seq, player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
 /* -------------------- PARTY / SPECIES -------------------- */
