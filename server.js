@@ -1,5 +1,4 @@
-// server.js — Monster Game backend (Postgres)
-// 256×256 chunks • LRU chunk cache • seq-aware sync that supports dx/dy OR absolute coords
+// server.js — Monster Game backend (Postgres) — 256×256 chunks + sync sequencing
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -7,7 +6,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
-const world = require('./world');
+const world = require('./world'); // must export generateChunk(cx, cy) -> { w:256,h:256,tiles:[[]] }
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -32,35 +31,6 @@ const pool = new Pool({
 /* -------------------- CONSTS -------------------- */
 const CHUNK_W = 256;
 const CHUNK_H = 256;
-
-/* -------------------- IN-MEM STATE -------------------- */
-// Tracks last processed seq and last accepted pos per session token
-const SYNC_STATE = new Map(); // token -> { lastSeq: number, lastPos: { cx, cy, tx, ty } }
-
-// LRU caches to avoid regenerating chunks/encounters constantly
-const CHUNK_CACHE_MAX = 128;
-const CHUNK_CACHE = new Map();     // key: `${cx},${cy}` -> { w,h,tiles }
-const ENCOUNTER_CACHE = new Map(); // key: `${cx},${cy}` -> encounterTable
-
-/* -------------------- HELPERS -------------------- */
-function lruGet(map, key){ const v = map.get(key); if (v){ map.delete(key); map.set(key, v); } return v; }
-function lruSet(map, key, val, max){
-  if (map.has(key)) map.delete(key);
-  map.set(key, val);
-  while (map.size > max){ const k = map.keys().next().value; map.delete(k); }
-}
-function getChunkCached(cx, cy){
-  const k = `${cx},${cy}`;
-  const hit = lruGet(CHUNK_CACHE, k);
-  if (hit) return hit;
-  const gen = world.generateChunk(cx, cy);
-  lruSet(CHUNK_CACHE, k, gen, CHUNK_CACHE_MAX);
-  return gen;
-}
-function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-function toWorldXY(cx, cy, tx, ty){ return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty }; }
-function manhattan(wx1, wy1, wx2, wy2){ return Math.abs(wx1 - wx2) + Math.abs(wy1 - wy2); }
-function clamp(n,min,max){ return n<min?min:(n>max?max:n); }
 
 /* -------------------- DB INIT + NORMALIZE -------------------- */
 async function normalizePlayerPositions() {
@@ -208,10 +178,10 @@ async function getParty(player_id){
   return rows;
 }
 
-/* -------------------- ENCOUNTER TABLE (cached) -------------------- */
+/* -------------------- ENCOUNTERS / CHUNK -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
-  const chunk = getChunkCached(cx, cy);
+  const chunk = world.generateChunk(cx, cy); // w=256,h=256
   const counts = {};
   for (let y=0; y<chunk.h; y+=16){
     for (let x=0; x<chunk.w; x+=16){
@@ -239,14 +209,6 @@ async function buildEncounterTableForChunk(cx, cy){
     biomes: x.biomes
   }));
 }
-async function getEncounterTableCached(cx, cy){
-  const k = `${cx},${cy}`;
-  const hit = lruGet(ENCOUNTER_CACHE, k);
-  if (hit) return hit;
-  const table = await buildEncounterTableForChunk(cx, cy);
-  lruSet(ENCOUNTER_CACHE, k, table, CHUNK_CACHE_MAX);
-  return table;
-}
 
 /* -------------------- BASIC -------------------- */
 app.get('/', (req,res)=>res.type('text').send('Monster Game API online. Try /api/health'));
@@ -267,9 +229,6 @@ app.post('/api/register', async (req,res)=>{
     const tok = await createSession(player_id);
     const st = await getState(player_id);
     const party = await getParty(player_id);
-
-    SYNC_STATE.set(tok, { lastSeq: 0, lastPos: { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty } });
-
     return res.json({ token: tok, player: { handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
   } catch(e){ console.error('register error', e); return res.status(500).json({ error:'server_error' }); }
 });
@@ -284,9 +243,6 @@ app.post('/api/login', async (req,res)=>{
     const tok = await createSession(p.id);
     const st = await getState(p.id);
     const party = await getParty(p.id);
-
-    SYNC_STATE.set(tok, { lastSeq: 0, lastPos: { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty } });
-
     return res.json({ token: tok, player: { handle: p.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
   } catch(e){ console.error('login error', e); return res.status(500).json({ error:'server_error' }); }
 });
@@ -307,8 +263,8 @@ app.get('/api/chunk', auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
   const x = parseInt(req.query.x ?? st.cx, 10);
   const y = parseInt(req.query.y ?? st.cy, 10);
-  const chunk = getChunkCached(x, y);
-  const encounterTable = await getEncounterTableCached(x, y);
+  const chunk = world.generateChunk(x, y);
+  const encounterTable = await buildEncounterTableForChunk(x, y);
   res.json({ x, y, chunk: { ...chunk, encounterTable } });
 });
 
@@ -326,91 +282,44 @@ app.post('/api/move', auth, async (req,res)=>{
   if (ty >= CHUNK_H){ ty = 0; cy += 1; }
 
   await setState(req.session.player_id, cx, cy, tx, ty);
-
-  // remember lastPos for this token (helps seq logic)
-  const rec = SYNC_STATE.get(req.session.token) || { lastSeq: 0, lastPos: null };
-  rec.lastPos = { cx, cy, tx, ty };
-  SYNC_STATE.set(req.session.token, rec);
-
-  const chunk = getChunkCached(cx, cy);
-  const encounterTable = await getEncounterTableCached(cx, cy);
+  const chunk = world.generateChunk(cx, cy);
+  const encounterTable = await buildEncounterTableForChunk(cx, cy);
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- SYNC (accepts dx/dy OR absolute; seq-aware) -------------------- */
+/* -------------------- SYNC (absolute coords accepted; small anti-teleport) -------------------- */
+function worldTiles(cx, cy, tx, ty){
+  return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
+}
 app.post('/api/sync', auth, async (req,res)=>{
-  const tokenStr = req.headers.authorization || req.query.token;
-  const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
-  const seq = Number(req.body?.seq) || 0;
-
-  // If stale or duplicate seq, just return current server state
-  if (seq && seq <= rec.lastSeq){
-    const st0 = rec.lastPos || await getState(req.session.player_id);
-    const chunk0 = getChunkCached(st0.cx, st0.cy);
-    const table0 = await getEncounterTableCached(st0.cx, st0.cy);
-    return res.json({
-      seq: rec.lastSeq,
-      player: { handle: req.session.handle, cx: st0.cx, cy: st0.cy, tx: st0.tx, ty: st0.ty, party: await getParty(req.session.player_id) },
-      chunk: { ...chunk0, encounterTable: table0 }
-    });
+  let { cx, cy, tx, ty, seq } = req.body || {};
+  cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty); seq = Number(seq) || 0;
+  if (!Number.isInteger(cx)||!Number.isInteger(cy)||!Number.isInteger(tx)||!Number.isInteger(ty)){
+    return res.status(400).json({ error:'bad_coords' });
   }
 
-  // Start from authoritative state
+  // Normalize 0..255 and carry chunk coords
+  while (tx < 0){ tx += CHUNK_W; cx -= 1; }
+  while (ty < 0){ ty += CHUNK_H; cy -= 1; }
+  while (tx >= CHUNK_W){ tx -= CHUNK_W; cx += 1; }
+  while (ty >= CHUNK_H){ ty -= CHUNK_H; cy += 1; }
+
   const st = await getState(req.session.player_id);
-  let { cx, cy, tx, ty } = st;
+  const prev = worldTiles(st.cx, st.cy, st.tx, st.ty);
+  const next = worldTiles(cx, cy, tx, ty);
+  const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
 
-  // 1) Relative move support (dx/dy)
-  const hasDxDy = typeof req.body?.dx !== 'undefined' || typeof req.body?.dy !== 'undefined';
-  if (hasDxDy){
-    const dx = Math.max(-1, Math.min(1, Number(req.body.dx) || 0));
-    const dy = Math.max(-1, Math.min(1, Number(req.body.dy) || 0));
-
-    tx += dx; ty += dy;
-    if (tx < 0){ tx = CHUNK_W-1; cx -= 1; }
-    if (tx >= CHUNK_W){ tx = 0; cx += 1; }
-    if (ty < 0){ ty = CHUNK_H-1; cy -= 1; }
-    if (ty >= CHUNK_H){ ty = 0; cy += 1; }
-
-    await setState(req.session.player_id, cx, cy, tx, ty);
+  // Modest anti-teleport; legit play stays far below this
+  if (dist > 64){
+    cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
   } else {
-    // 2) Absolute coords (cx,cy,tx,ty) — accept with a soft distance guard
-    const hasAbs =
-      Number.isInteger(Number(req.body?.cx)) &&
-      Number.isInteger(Number(req.body?.cy)) &&
-      Number.isInteger(Number(req.body?.tx)) &&
-      Number.isInteger(Number(req.body?.ty));
-
-    if (hasAbs){
-      let ncx = Number(req.body.cx), ncy = Number(req.body.cy), ntx = Number(req.body.tx), nty = Number(req.body.ty);
-
-      // normalize 0..255 with carry
-      while (ntx < 0){ ntx += CHUNK_W; ncx -= 1; }
-      while (nty < 0){ nty += CHUNK_H; ncy -= 1; }
-      while (ntx >= CHUNK_W){ ntx -= CHUNK_W; ncx += 1; }
-      while (nty >= CHUNK_H){ nty -= CHUNK_H; ncy += 1; }
-
-      const from = toWorldXY(cx, cy, tx, ty);
-      const to   = toWorldXY(ncx, ncy, ntx, nty);
-      const seqDelta = Math.max(1, seq - rec.lastSeq);
-      const maxDist = Math.min(64, 4 + 4*seqDelta);
-
-      if (manhattan(from.wx, from.wy, to.wx, to.wy) <= maxDist){
-        cx = ncx; cy = ncy; tx = ntx; ty = nty;
-        await setState(req.session.player_id, cx, cy, tx, ty);
-      }
-      // else: ignore big jump; fall through and return current st
-    }
-    // else: no movement fields — just return current st
+    await setState(req.session.player_id, cx, cy, tx, ty);
   }
 
-  // update seq + lastPos
-  const lastPos = { cx, cy, tx, ty };
-  SYNC_STATE.set(tokenStr, { lastSeq: seq || rec.lastSeq, lastPos });
-
-  const chunk = getChunkCached(cx, cy);
-  const encounterTable = await getEncounterTableCached(cx, cy);
+  const chunk = world.generateChunk(cx, cy);
+  const encounterTable = await buildEncounterTableForChunk(cx, cy);
   res.json({
-    seq: (seq || rec.lastSeq),
+    seq,
     player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) },
     chunk: { ...chunk, encounterTable }
   });
@@ -429,6 +338,7 @@ app.get('/api/species', auth, async (req,res)=>{
 /* -------------------- BATTLE (wild) -------------------- */
 const battles = new Map();
 function rnd(){ return Math.random(); }
+function clamp(n,min,max){ return n<min?min:(n>max?max:n); }
 function calcDamage(attacker, move, defender){
   const base = move.power || 8;
   const atk = 10 + attacker.level * 2;
@@ -530,6 +440,7 @@ wss.on('connection', (ws)=>{ ws.isAlive = true; ws.on('pong', ()=>ws.isAlive = t
 setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate(); ws.isAlive=false; ws.ping(); }); }, 30000);
 
 /* -------------------- BOOT -------------------- */
+function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 initDB()
   .then(()=>{ server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT)); })
   .catch((e)=>{ console.error('DB init failed:', e); process.exit(1); });
