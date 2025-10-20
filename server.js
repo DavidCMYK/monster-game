@@ -185,6 +185,89 @@ app.post('/api/heal', auth, async (req,res)=>{
 /* ---------- world/chunk, sync, battles ---------- */
 /* ... KEEP THE REST OF THE FILE EXACTLY AS IN THE LAST VERSION I GAVE YOU ...
    (chunk/species endpoints, /api/move, /api/sync, and all battle routes remain unchanged) */
+// ----- helper: build an encounter table for a generated chunk -----
+async function buildEncounterTableForChunk(cx, cy) {
+  // Generate chunk to analyze its biomes
+  const ch = world.generateChunk(cx, cy);
+  const counts = {};
+  for (const row of ch.tiles) {
+    for (const t of row) {
+      const b = (t && t.biome) || 'unknown';
+      counts[b] = (counts[b] || 0) + 1;
+    }
+  }
+  // Dominant biome in this chunk
+  let dominant = 'grassland';
+  let max = -1;
+  for (const [b, c] of Object.entries(counts)) {
+    if (c > max) { max = c; dominant = b; }
+  }
+  // Pull species that can spawn in this biome
+  const { rows } = await pool.query(
+    `SELECT id, name, base_spawn_rate
+       FROM mg_species
+      WHERE $1 = ANY(biomes)
+      ORDER BY id ASC`,
+    [dominant]
+  );
+  // Make a simple weighted table. If none match, fall back to all species.
+  const list = rows.length ? rows : (await pool.query(
+    `SELECT id, name, base_spawn_rate FROM mg_species ORDER BY id ASC`
+  )).rows;
+
+  // Normalize to simple weights for the client (not probabilities)
+  // Weight floor to avoid zeros
+  const table = list.map(s => ({
+    speciesId: Number(s.id),
+    weight: Math.max(1, Math.round((s.base_spawn_rate || 0.05) * 100))
+  }));
+
+  return { biome: dominant, table };
+}
+
+// ----- species list (no auth required; safe to cache on client) -----
+app.get('/api/species', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, base_spawn_rate AS "baseSpawnRate", biomes, types
+         FROM mg_species
+         ORDER BY id ASC`
+    );
+    res.json({ species: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ----- chunk fetch (auth) -----
+app.get('/api/chunk', auth, async (req, res) => {
+  try {
+    // Use requested x,y or the player's current chunk
+    const st = await getState(req.session.player_id);
+    const x = parseInt(req.query.x ?? st.cx, 10);
+    const y = parseInt(req.query.y ?? st.cy, 10);
+    const ch = world.generateChunk(x, y);
+    const enc = await buildEncounterTableForChunk(x, y);
+    res.json({ x, y, chunk: { ...ch, encounterTable: enc.table, biome: enc.biome } });
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ----- alias without /api for older clients or direct Render base -----
+app.get('/chunk', auth, async (req, res) => {
+  try {
+    const st = await getState(req.session.player_id);
+    const x = parseInt(req.query.x ?? st.cx, 10);
+    const y = parseInt(req.query.y ?? st.cy, 10);
+    const ch = world.generateChunk(x, y);
+    const enc = await buildEncounterTableForChunk(x, y);
+    res.json({ x, y, chunk: { ...ch, encounterTable: enc.table, biome: enc.biome } });
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
