@@ -1,4 +1,5 @@
-// server.js — sessions, chunking, encounters, absolute sync, battles w/ PP + capture
+// server.js — sessions, chunking, encounters, absolute sync,
+// battles with PP + capture, faint protection, /api/heal, and starter move backfill
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -126,7 +127,7 @@ async function createPlayer(email, handle, password){
   const { rows } = await pool.query(`INSERT INTO mg_players (email,handle,password_hash) VALUES ($1,$2,$3) RETURNING id`, [email,handle,hash]);
   const player_id = rows[0].id;
   await pool.query(`INSERT INTO mg_player_state (player_id,cx,cy,tx,ty) VALUES ($1,0,0,$2,$3)`, [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]);
-  // seed starter with one move
+  // seed starter with two moves (Strike + Guard)
   await pool.query(`
     INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
     VALUES ($1,1,3,0,28,28,'rescue:blink','[
@@ -145,15 +146,41 @@ async function getSession(tok){
   ); return rows[0]||null;
 }
 async function deleteSession(tok){ await pool.query(`DELETE FROM mg_sessions WHERE token=$1`, [tok]); }
+
 async function getState(player_id){ const { rows } = await pool.query(`SELECT player_id,cx,cy,tx,ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`, [player_id]); return rows[0]||null; }
 async function setState(player_id,cx,cy,tx,ty){ await pool.query(`UPDATE mg_player_state SET cx=$1,cy=$2,tx=$3,ty=$4,updated_at=now() WHERE player_id=$5`,[cx,cy,tx,ty,player_id]); }
+
 async function getParty(player_id){
   const { rows } = await pool.query(`SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 6`, [player_id]);
   return rows;
 }
+async function ensureHasParty(owner_id){
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
+  if ((rows[0]?.c||0) === 0){
+    await pool.query(`
+      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
+      VALUES ($1,1,3,0,28,28,'rescue:blink','[
+        {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]},
+        {"name":"Guard","base":"status","power":0,"accuracy":1.0,"pp":15,"stack":["buff_def"]}
+      ]'::jsonb)
+    `, [owner_id]);
+  }
+}
+// Backfill a second move for old accounts
+async function ensureStarterMoves(owner_id){
+  const { rows } = await pool.query(`SELECT id,moves FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 1`, [owner_id]);
+  if (!rows.length) return;
+  const id = rows[0].id;
+  let moves = rows[0].moves || [];
+  const hasStrike = moves.some(m => (m.name||'').toLowerCase() === 'strike');
+  const hasGuard  = moves.some(m => (m.name||'').toLowerCase() === 'guard');
+  if (!hasGuard){
+    moves = moves.slice(0,3).concat([{ name:'Guard', base:'status', power:0, accuracy:1.0, pp:15, stack:['buff_def'] }]);
+    await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`, [JSON.stringify(moves), id, owner_id]);
+  }
+}
 
 /* ---------- middleware ---------- */
-app.use((req,res,next)=>next());
 async function auth(req,res,next){
   try{
     const t = req.headers.authorization || req.query.token;
@@ -193,17 +220,28 @@ app.post('/api/login', async (req,res)=>{
     const ok = await bcrypt.compare(password, p.password_hash);
     if (!ok) return res.status(401).json({ error:'Invalid credentials' });
     const tok = await createSession(p.id);
+    await ensureHasParty(p.id);
+    await ensureStarterMoves(p.id);
     const st = await getState(p.id);
     const party = await getParty(p.id);
     res.json({ token: tok, player: { handle:p.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
   }catch(e){ console.error('login',e); res.status(500).json({ error:'server_error' }); }
 });
 app.get('/api/session', auth, async (req,res)=>{
+  await ensureHasParty(req.session.player_id);
+  await ensureStarterMoves(req.session.player_id);
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   res.json({ token: req.session.token, player: { handle:req.session.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
 });
 app.post('/api/logout', auth, async (req,res)=>{ await deleteSession(req.session.token); res.json({ ok:true }); });
+
+/* ---------- heal ---------- */
+app.post('/api/heal', auth, async (req,res)=>{
+  await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [req.session.player_id]);
+  const party = await getParty(req.session.player_id);
+  res.json({ ok:true, party });
+});
 
 /* ---------- world/chunk ---------- */
 async function buildEncounterTableForChunk(cx,cy){
@@ -284,7 +322,7 @@ app.post('/api/sync', auth, async (req,res)=>{
   res.json({ seq, player:{ handle:req.session.handle,cx,cy,tx,ty, party: await getParty(req.session.player_id) }, chunk:{...chunk,encounterTable} });
 });
 
-/* ---------- battles (PP + capture) ---------- */
+/* ---------- battles (PP + capture + faint handling) ---------- */
 const battles = new Map();
 function rnd(){ return Math.random(); }
 function clamp(n,min,max){ return n<min?min:(n>max?max:n); }
@@ -300,17 +338,23 @@ function levelUp(mon){
   if (mon.xp >= need){ mon.xp -= need; mon.level += 1; mon.max_hp += 4; mon.hp = mon.max_hp; return true; }
   return false;
 }
-
-// Build simple PP map from move list
 function ppFromMoves(moves){
   const m = {}; (moves||[]).forEach(v => { const pp = Number(v.pp)||20; m[String(v.name||'Unknown')] = pp; });
   return m;
 }
 
 app.post('/api/battle/start', auth, async (req,res)=>{
+  await ensureHasParty(req.session.player_id);
+  await ensureStarterMoves(req.session.player_id);
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   if (!party.length) return res.status(400).json({ error:'no_party' });
+
+  const you = { ...party[0] };
+  you.moves = Array.isArray(you.moves) ? you.moves : [];
+  if (you.hp <= 0){
+    return res.status(409).json({ error:'fainted', need_heal:true });
+  }
 
   const table = await buildEncounterTableForChunk(st.cx, st.cy);
   let chosen = table[0] || { speciesId:1, name:'Fieldling', baseSpawnRate:1.0 };
@@ -323,15 +367,7 @@ app.post('/api/battle/start', auth, async (req,res)=>{
   const enemy = { speciesId: chosen.speciesId, level: 1 + Math.floor(Math.random()*5) };
   enemy.max_hp = 16 + enemy.level*4; enemy.hp = enemy.max_hp;
 
-  const you = { ...party[0] };
-  // Ensure moves array exists
-  you.moves = Array.isArray(you.moves) ? you.moves : [];
-
-  const battle = {
-    player_id: req.session.player_id,
-    you, enemy, log: [],
-    pp: ppFromMoves(you.moves) // track remaining PP by move name
-  };
+  const battle = { player_id: req.session.player_id, you, enemy, log: [], finished:false, pp: ppFromMoves(you.moves) };
   battles.set(req.session.token, battle);
   res.json({ you, enemy, log: battle.log, pp: battle.pp, _dbg: { tableLen: table.length } });
 });
@@ -352,25 +388,22 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
 
   if (action === 'move'){
     const moveName = String(req.body?.move || 'Strike');
-    const mv = (you.moves||[]).find(m => (m.name||'').toLowerCase() === moveName.toLowerCase());
-    const chosen = mv || { name:'Strike', power:8, accuracy:0.95, pp:25, base:'physical' };
+    const mv = (you.moves||[]).find(m => (m.name||'').toLowerCase() === moveName.toLowerCase())
+            || { name:'Strike', power:8, accuracy:0.95, pp:25, base:'physical' };
 
-    // PP check/enforce
-    const left = b.pp[chosen.name] ?? (chosen.pp || 20);
+    const left = b.pp[mv.name] ?? (mv.pp || 20);
     if (left <= 0){
-      b.log.push(`${chosen.name} has no PP left!`);
+      b.log.push(`${mv.name} has no PP left!`);
       return res.json({ you, enemy, log:b.log, pp:b.pp });
     }
+    b.pp[mv.name] = left - 1;
 
-    // spend PP
-    b.pp[chosen.name] = left - 1;
-
-    if (Math.random() < (chosen.accuracy ?? 0.95)){
-      const dmg = calcDamage(you, chosen, enemy);
+    if (Math.random() < (mv.accuracy ?? 0.95)){
+      const dmg = calcDamage(you, mv, enemy);
       enemy.hp = clamp(enemy.hp - dmg, 0, enemy.max_hp);
-      b.log.push(`You used ${chosen.name}. It dealt ${dmg}.`);
+      b.log.push(`You used ${mv.name}. It dealt ${dmg}.`);
     } else {
-      b.log.push(`Your ${chosen.name} missed.`);
+      b.log.push(`Your ${mv.name} missed.`);
     }
 
     if (enemy.hp <= 0){
@@ -382,7 +415,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       return res.json({ result:'enemy_down', you, enemy, log:b.log, pp:b.pp });
     }
 
-    // Enemy counter-turn (simple)
+    // enemy turn
     const em = { name:'Bite', power:7, accuracy:0.9 };
     if (Math.random() < em.accuracy){
       const dmg2 = calcDamage(enemy, em, you);
@@ -390,6 +423,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       b.log.push(`Enemy used ${em.name}. You took ${dmg2}.`);
       await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [you.hp, you.id, req.session.player_id]);
       if (you.hp <= 0){
+        b.finished = true;
         battles.delete(req.session.token);
         return res.json({ result:'you_down', you, enemy, log:b.log, pp:b.pp });
       }
