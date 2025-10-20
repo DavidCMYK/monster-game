@@ -1,4 +1,4 @@
-// server.js — Monster Game backend (Postgres) — SPEC: 256×256 chunks
+// server.js — Monster Game backend (Postgres) — 256×256 chunks + sync sequencing
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -6,7 +6,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
-const world = require('./world'); // must export generateChunk(cx, cy) with {w:256,h:256,tiles:...}
+const world = require('./world'); // must export generateChunk(cx, cy) -> { w:256,h:256,tiles:[[]] }
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -34,7 +34,6 @@ const CHUNK_H = 256;
 
 /* -------------------- DB INIT + NORMALIZE -------------------- */
 async function normalizePlayerPositions() {
-  console.log('→ Normalizing player positions to 256×256 bounds…');
   await pool.query(`
     WITH norm AS (
       SELECT
@@ -51,7 +50,7 @@ async function normalizePlayerPositions() {
     FROM norm n
     WHERE s.player_id = n.player_id;
   `);
-  console.log('✓ Normalization pass complete.');
+  console.log('✓ Normalization pass complete (256×256).');
 }
 
 async function initDB() {
@@ -105,7 +104,6 @@ async function initDB() {
     );
   `);
 
-  // Seed a few species if none exist
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0) {
     await pool.query(`
@@ -116,7 +114,6 @@ async function initDB() {
     `);
   }
 
-  // One-time/each-boot normalization to kill rubber-banding from OOB tx/ty
   await normalizePlayerPositions();
 }
 
@@ -142,7 +139,6 @@ async function createPlayer(email, handle, password){
     `INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,$2,$3)`,
     [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]
   );
-  // Give a simple starter monster
   await pool.query(`
     INSERT INTO mg_monsters (owner_id, species_id, level, xp, hp, max_hp, ability, moves)
     VALUES ($1, 1, 3, 0, 28, 28, 'rescue:blink', '[
@@ -234,7 +230,7 @@ async function auth(req,res,next){
 /* -------------------- ENCOUNTERS / CHUNK -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
-  const chunk = world.generateChunk(cx, cy); // assumes w=256,h=256
+  const chunk = world.generateChunk(cx, cy); // w=256,h=256
   const counts = {};
   for (let y=0; y<chunk.h; y+=16){
     for (let x=0; x<chunk.w; x+=16){
@@ -292,18 +288,18 @@ app.post('/api/move', auth, async (req,res)=>{
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- ABSOLUTE SYNC (authoritative) -------------------- */
+/* -------------------- ABSOLUTE SYNC (w/ sequence) -------------------- */
 function worldTiles(cx, cy, tx, ty){
   return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
 }
 app.post('/api/sync', auth, async (req,res)=>{
-  let { cx, cy, tx, ty } = req.body || {};
-  cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty);
+  let { cx, cy, tx, ty, seq } = req.body || {};
+  cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty); seq = Number(seq) || 0;
   if (!Number.isInteger(cx)||!Number.isInteger(cy)||!Number.isInteger(tx)||!Number.isInteger(ty)){
     return res.status(400).json({ error:'bad_coords' });
   }
 
-  // Normalize into 0..255 and carry into chunk coords
+  // Normalize 0..255 and carry chunk coords
   while (tx < 0){ tx += CHUNK_W; cx -= 1; }
   while (ty < 0){ ty += CHUNK_H; cy -= 1; }
   while (tx >= CHUNK_W){ tx -= CHUNK_W; cx += 1; }
@@ -314,16 +310,20 @@ app.post('/api/sync', auth, async (req,res)=>{
   const next = worldTiles(cx, cy, tx, ty);
   const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
 
-  // Allow modest step bursts; clamp only if absurd
-  const MAX_ALLOWED = 32; // tiles since last save
-  if (dist > MAX_ALLOWED){
+  // Modest anti-teleport; legit play stays far below this
+  if (dist > 64){
     cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
+  } else {
+    await setState(req.session.player_id, cx, cy, tx, ty);
   }
 
-  await setState(req.session.player_id, cx, cy, tx, ty);
   const chunk = world.generateChunk(cx, cy);
   const encounterTable = await buildEncounterTableForChunk(cx, cy);
-  res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
+  res.json({
+    seq,
+    player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) },
+    chunk: { ...chunk, encounterTable }
+  });
 });
 
 /* -------------------- PARTY / SPECIES -------------------- */
@@ -331,7 +331,6 @@ app.get('/api/party', auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
   res.json({ party });
 });
-
 app.get('/api/species', auth, async (req,res)=>{
   const { rows } = await pool.query(`SELECT id, name, base_spawn_rate AS "baseSpawnRate", biomes, types FROM mg_species ORDER BY id ASC`);
   res.json({ species: rows });
@@ -433,35 +432,6 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
   }
 
   return res.status(400).json({ error:'bad_action' });
-});
-
-app.post('/api/battle/capture', auth, async (req,res)=>{
-  const b = battles.get(req.session.token);
-  if (!b) return res.status(400).json({ error:'no_battle' });
-  if (b.enemy.hp > 0) return res.status(400).json({ error:'enemy_not_defeated' });
-
-  const party = await getParty(req.session.player_id);
-  const playerLevel = party.reduce((m,p)=>Math.max(m,p.level), 1);
-  const baseCapture = 0.25;
-  const chance = Math.min(0.95, baseCapture * (1 + playerLevel * 0.03));
-
-  const roll = Math.random();
-  if (roll < chance){
-    const lvl = Math.max(1, b.enemy.level);
-    const max_hp = 14 + lvl*4;
-    const { rows } = await pool.query(`
-      INSERT INTO mg_monsters (owner_id, species_id, level, xp, hp, max_hp, ability, moves)
-      VALUES ($1,$2,$3,0,$4,$5,'rescue:blink','[
-        {"name":"Tackle","base":"physical","power":6,"accuracy":0.95,"pp":30,"stack":["dmg_phys"]}
-      ]'::jsonb)
-      RETURNING id, species_id, level, xp, hp, max_hp, ability, moves
-    `, [req.session.player_id, b.enemy.speciesId, Math.max(1, b.enemy.level), max_hp, max_hp]);
-    battles.delete(req.session.token);
-    return res.json({ result:'captured', captured: rows[0] });
-  } else {
-    battles.delete(req.session.token);
-    return res.json({ result:'escaped' });
-  }
 });
 
 /* -------------------- WS KEEPALIVE -------------------- */
