@@ -259,7 +259,7 @@ async function getEncounterTableCached(cx, cy){
 
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
-  const chunk = world.generateChunk(cx, cy); // w=256,h=256
+  const chunk = getChunkCached(cx, cy); // <-- was world.generateChunk
   const counts = {};
   for (let y=0; y<chunk.h; y+=16){
     for (let x=0; x<chunk.w; x+=16){
@@ -280,14 +280,14 @@ async function buildEncounterTableForChunk(cx, cy){
   }).sort((a,b)=>b.score-a.score);
   const pick = scored.slice(0, 12);
   const sum = pick.reduce((a,x)=>a+x.baseSpawnRate, 0) || 1;
-  const table = pick.slice(0,10).map(x => ({
+  return pick.slice(0,10).map(x => ({
     speciesId: x.speciesId,
     name: x.name,
     baseSpawnRate: Math.max(0.01, x.baseSpawnRate / sum),
     biomes: x.biomes
   }));
-  return table;
 }
+
 
 // /api/chunk
 app.get('/api/chunk', auth, async (req,res)=>{
