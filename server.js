@@ -1,4 +1,4 @@
-// server.js — Monster Game backend (Postgres) — 256×256 chunks + sync sequencing
+// server.js — Monster Game backend (Postgres) — 256×256 chunks + seq-aware sync + chunk caching
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -31,9 +31,36 @@ const pool = new Pool({
 /* -------------------- CONSTS -------------------- */
 const CHUNK_W = 256;
 const CHUNK_H = 256;
+
+/* -------------------- IN-MEM STATE -------------------- */
+// Per-session sync guard: last processed sequence + last accepted position
+const SYNC_STATE = new Map(); // token -> { lastSeq: number, lastPos: { cx, cy, tx, ty } }
+
+// LRU caches for chunk tiles and encounter tables
 const CHUNK_CACHE_MAX = 128;
-const CHUNK_CACHE = new Map();           // key: `${cx},${cy}` -> { w,h,tiles }
-const ENCOUNTER_CACHE = new Map();       // key: `${cx},${cy}` -> encounterTable
+const CHUNK_CACHE = new Map();     // key: `${cx},${cy}` -> { w,h,tiles }
+const ENCOUNTER_CACHE = new Map(); // key: `${cx},${cy}` -> encounterTable
+
+/* -------------------- CACHE HELPERS -------------------- */
+function lruGet(map, key){ const v = map.get(key); if (v){ map.delete(key); map.set(key, v); } return v; }
+function lruSet(map, key, val, max){
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  while (map.size > max){ const k = map.keys().next().value; map.delete(k); }
+}
+function getChunkCached(cx, cy){
+  const k = `${cx},${cy}`;
+  const hit = lruGet(CHUNK_CACHE, k);
+  if (hit) return hit;
+  const gen = world.generateChunk(cx, cy); // deterministic
+  lruSet(CHUNK_CACHE, k, gen, CHUNK_CACHE_MAX);
+  return gen;
+}
+
+/* -------------------- UTILS -------------------- */
+function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+function toWorldXY(cx, cy, tx, ty){ return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty }; }
+function manhattan(wx1, wy1, wx2, wy2){ return Math.abs(wx1 - wx2) + Math.abs(wy1 - wy2); }
 
 /* -------------------- DB INIT + NORMALIZE -------------------- */
 async function normalizePlayerPositions() {
@@ -120,9 +147,7 @@ async function initDB() {
   await normalizePlayerPositions();
 }
 
-/* -------------------- UTIL -------------------- */
-function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-
+/* -------------------- SIMPLE QUERIES -------------------- */
 async function getPlayerByEmail(email){
   const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]);
   return rows[0] || null;
@@ -183,83 +208,10 @@ async function getParty(player_id){
   return rows;
 }
 
-/* -------------------- BASIC -------------------- */
-app.get('/', (req,res)=>res.type('text').send('Monster Game API online. Try /api/health'));
-app.get('/api/health', async (req,res)=>{
-  try { const { rows } = await pool.query('SELECT 1 AS ok'); res.json({ ok: rows[0].ok === 1 }); }
-  catch (e){ res.status(500).json({ ok:false, db_error: e.code || String(e) }); }
-});
-
-/* -------------------- AUTH -------------------- */
-app.post('/api/register', async (req,res)=>{
-  try{
-    const { email, password, handle } = req.body || {};
-    if (!email || !password || !handle) return res.status(400).json({ error:'Missing fields' });
-    if (await getPlayerByEmail(email))  return res.status(409).json({ error:'Email already exists' });
-    if (await getPlayerByHandle(handle))return res.status(409).json({ error:'Handle already exists' });
-
-    const player_id = await createPlayer(email, handle, password);
-    const tok = await createSession(player_id);
-    const st = await getState(player_id);
-    const party = await getParty(player_id);
-    return res.json({ token: tok, player: { handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
-  } catch(e){ console.error('register error', e); return res.status(500).json({ error:'server_error' }); }
-});
-app.post('/api/login', async (req,res)=>{
-  try{
-    const { email, password } = req.body || {};
-    const p = await getPlayerByEmail(email);
-    if (!p) return res.status(401).json({ error:'Invalid credentials' });
-    const ok = await bcrypt.compare(password, p.password_hash);
-    if (!ok) return res.status(401).json({ error:'Invalid credentials' });
-    const tok = await createSession(p.id);
-    const st = await getState(p.id);
-    const party = await getParty(p.id);
-    return res.json({ token: tok, player: { handle: p.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
-  } catch(e){ console.error('login error', e); return res.status(500).json({ error:'server_error' }); }
-});
-
-/* -------------------- AUTH MIDDLEWARE -------------------- */
-async function auth(req,res,next){
-  try{
-    const t = req.headers.authorization || req.query.token;
-    if (!t) return res.status(401).json({ error:'Auth required' });
-    const sess = await getSession(t);
-    if (!sess) return res.status(401).json({ error:'Invalid session' });
-    req.session = sess; next();
-  } catch{ return res.status(500).json({ error:'server_error' }); }
-}
-
-/* -------------------- ENCOUNTERS / CHUNK -------------------- */
-
-function lruGet(map, key){ const v = map.get(key); if (v){ map.delete(key); map.set(key, v); } return v; }
-function lruSet(map, key, val, max){
-  if (map.has(key)) map.delete(key);
-  map.set(key, val);
-  while (map.size > max){ const k = map.keys().next().value; map.delete(k); }
-}
-
-function getChunkCached(cx, cy){
-  const k = `${cx},${cy}`;
-  const hit = lruGet(CHUNK_CACHE, k);
-  if (hit) return hit;
-  const gen = world.generateChunk(cx, cy); // deterministic + now no Math.random
-  lruSet(CHUNK_CACHE, k, gen, CHUNK_CACHE_MAX);
-  return gen;
-}
-
-async function getEncounterTableCached(cx, cy){
-  const k = `${cx},${cy}`;
-  const hit = lruGet(ENCOUNTER_CACHE, k);
-  if (hit) return hit;
-  const table = await buildEncounterTableForChunk(cx, cy);
-  lruSet(ENCOUNTER_CACHE, k, table, CHUNK_CACHE_MAX);
-  return table;
-}
-
+/* -------------------- ENCOUNTER TABLE (uses cached chunk) -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
-  const chunk = getChunkCached(cx, cy); // <-- was world.generateChunk
+  const chunk = getChunkCached(cx, cy);
   const counts = {};
   for (let y=0; y<chunk.h; y+=16){
     for (let x=0; x<chunk.w; x+=16){
@@ -287,9 +239,72 @@ async function buildEncounterTableForChunk(cx, cy){
     biomes: x.biomes
   }));
 }
+async function getEncounterTableCached(cx, cy){
+  const k = `${cx},${cy}`;
+  const hit = lruGet(ENCOUNTER_CACHE, k);
+  if (hit) return hit;
+  const table = await buildEncounterTableForChunk(cx, cy);
+  lruSet(ENCOUNTER_CACHE, k, table, CHUNK_CACHE_MAX);
+  return table;
+}
 
+/* -------------------- BASIC -------------------- */
+app.get('/', (req,res)=>res.type('text').send('Monster Game API online. Try /api/health'));
+app.get('/api/health', async (req,res)=>{
+  try { const { rows } = await pool.query('SELECT 1 AS ok'); res.json({ ok: rows[0].ok === 1 }); }
+  catch (e){ res.status(500).json({ ok:false, db_error: e.code || String(e) }); }
+});
 
-// /api/chunk
+/* -------------------- AUTH -------------------- */
+app.post('/api/register', async (req,res)=>{
+  try{
+    const { email, password, handle } = req.body || {};
+    if (!email || !password || !handle) return res.status(400).json({ error:'Missing fields' });
+    if (await getPlayerByEmail(email))  return res.status(409).json({ error:'Email already exists' });
+    if (await getPlayerByHandle(handle))return res.status(409).json({ error:'Handle already exists' });
+
+    const player_id = await createPlayer(email, handle, password);
+    const tok = await createSession(player_id);
+    const st = await getState(player_id);
+    const party = await getParty(player_id);
+
+    // Initialize sync state for this session token
+    SYNC_STATE.set(tok, { lastSeq: 0, lastPos: { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty } });
+
+    return res.json({ token: tok, player: { handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
+  } catch(e){ console.error('register error', e); return res.status(500).json({ error:'server_error' }); }
+});
+
+app.post('/api/login', async (req,res)=>{
+  try{
+    const { email, password } = req.body || {};
+    const p = await getPlayerByEmail(email);
+    if (!p) return res.status(401).json({ error:'Invalid credentials' });
+    const ok = await bcrypt.compare(password, p.password_hash);
+    if (!ok) return res.status(401).json({ error:'Invalid credentials' });
+    const tok = await createSession(p.id);
+    const st = await getState(p.id);
+    const party = await getParty(p.id);
+
+    // Initialize sync state for this session token
+    SYNC_STATE.set(tok, { lastSeq: 0, lastPos: { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty } });
+
+    return res.json({ token: tok, player: { handle: p.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
+  } catch(e){ console.error('login error', e); return res.status(500).json({ error:'server_error' }); }
+});
+
+/* -------------------- AUTH MIDDLEWARE -------------------- */
+async function auth(req,res,next){
+  try{
+    const t = req.headers.authorization || req.query.token;
+    if (!t) return res.status(401).json({ error:'Auth required' });
+    const sess = await getSession(t);
+    if (!sess) return res.status(401).json({ error:'Invalid session' });
+    req.session = sess; next();
+  } catch{ return res.status(500).json({ error:'server_error' }); }
+}
+
+/* -------------------- CHUNK -------------------- */
 app.get('/api/chunk', auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
   const x = parseInt(req.query.x ?? st.cx, 10);
@@ -313,15 +328,19 @@ app.post('/api/move', auth, async (req,res)=>{
   if (ty >= CHUNK_H){ ty = 0; cy += 1; }
 
   await setState(req.session.player_id, cx, cy, tx, ty);
+
+  // Update in-memory lastPos for this token
+  const tokenStr = req.session.token;
+  const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
+  rec.lastPos = { cx, cy, tx, ty };
+  SYNC_STATE.set(tokenStr, rec);
+
   const chunk = getChunkCached(cx, cy);
   const encounterTable = await getEncounterTableCached(cx, cy);
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- ABSOLUTE SYNC (w/ sequence) -------------------- */
-function worldTiles(cx, cy, tx, ty){
-  return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
-}
+/* -------------------- ABSOLUTE SYNC (sequence-aware) -------------------- */
 app.post('/api/sync', auth, async (req,res)=>{
   let { cx, cy, tx, ty, seq } = req.body || {};
   cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty); seq = Number(seq) || 0;
@@ -335,21 +354,51 @@ app.post('/api/sync', auth, async (req,res)=>{
   while (tx >= CHUNK_W){ tx -= CHUNK_W; cx += 1; }
   while (ty >= CHUNK_H){ ty -= CHUNK_H; cy += 1; }
 
-  const st = await getState(req.session.player_id);
-  const prev = worldTiles(st.cx, st.cy, st.tx, st.ty);
-  const next = worldTiles(cx, cy, tx, ty);
-  const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
+  const tokenStr = req.headers.authorization || req.query.token;
+  const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
 
-  // Modest anti-teleport; legit play stays far below this
-  if (dist > 64){
-    cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
+  // Drop stale or duplicate packets outright
+  if (seq <= rec.lastSeq){
+    const st = rec.lastPos || await getState(req.session.player_id);
+    const chunkStale = getChunkCached(st.cx, st.cy);
+    const encounterTableStale = await getEncounterTableCached(st.cx, st.cy);
+    return res.json({
+      seq: rec.lastSeq,
+      player: { handle: req.session.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party: await getParty(req.session.player_id) },
+      chunk: { ...chunkStale, encounterTable: encounterTableStale }
+    });
+  }
+
+  // Compare against newest known position (prefer in-memory)
+  let base = rec.lastPos;
+  if (!base){
+    const st = await getState(req.session.player_id);
+    base = { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty };
+  }
+
+  // Soft anti-teleport: allowance grows with seq gap, capped
+  const from = toWorldXY(base.cx, base.cy, base.tx, base.ty);
+  const to   = toWorldXY(cx, cy, tx, ty);
+  const seqDelta = Math.max(1, seq - rec.lastSeq);
+  const maxDist = Math.min(64, 4 + 4*seqDelta);
+
+  let next = { cx, cy, tx, ty };
+  if (manhattan(from.wx, from.wy, to.wx, to.wy) > maxDist){
+    next = base; // reject big jump
   } else {
     await setState(req.session.player_id, cx, cy, tx, ty);
   }
 
-  const chunk = getChunkCached(cx, cy);
-  const encounterTable = await getEncounterTableCached(cx, cy);
-  res.json({ seq, player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
+  // Update in-memory seq + pos
+  SYNC_STATE.set(tokenStr, { lastSeq: seq, lastPos: next });
+
+  const chunk = getChunkCached(next.cx, next.cy);
+  const encounterTable = await getEncounterTableCached(next.cx, next.cy);
+  res.json({
+    seq,
+    player: { handle: req.session.handle, cx: next.cx, cy: next.cy, tx: next.tx, ty: next.ty, party: await getParty(req.session.player_id) },
+    chunk: { ...chunk, encounterTable }
+  });
 });
 
 /* -------------------- PARTY / SPECIES -------------------- */
