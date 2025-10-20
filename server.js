@@ -1,4 +1,4 @@
-// server.js — sessions, world, encounters, absolute sync
+// server.js — sessions, world, sync, battles (full)
 // Battles: PP, capture-after-KO with fixed odds, party switch, auto-sub on KO, heal
 const express = require('express');
 const http = require('http');
@@ -28,7 +28,7 @@ const pool = new Pool({
 
 const CHUNK_W = 256, CHUNK_H = 256;
 
-/* ---------- DB / helpers (unchanged from last drop) ---------- */
+/* ---------- DB setup ---------- */
 async function normalizePlayerPositions(){ if (String(SKIP_NORMALIZE_ON_BOOT).toLowerCase() === 'true') return;
   await pool.query(`
     WITH norm AS (
@@ -65,9 +65,11 @@ async function initDB(){
 }
 initDB().then(()=>console.log('✓ DB ready')).catch(e=>{ console.error('DB init failed',e); process.exit(1); });
 
+/* ---------- helpers ---------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 async function getPlayerByEmail(email){ const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]); return rows[0]||null; }
 async function getPlayerByHandle(handle){ const { rows } = await pool.query(`SELECT * FROM mg_players WHERE handle=$1 LIMIT 1`, [handle]); return rows[0]||null; }
+
 async function createPlayer(email, handle, password){
   const hash = await bcrypt.hash(password, 10);
   const { rows } = await pool.query(`INSERT INTO mg_players (email,handle,password_hash) VALUES ($1,$2,$3) RETURNING id`, [email,handle,hash]);
@@ -169,108 +171,242 @@ app.get('/api/session', auth, async (req,res)=>{
 });
 app.post('/api/logout', auth, async (req,res)=>{ await deleteSession(req.session.token); res.json({ ok:true }); });
 
-/* ---------- NEW: party endpoint ---------- */
+/* ---------- party & heal ---------- */
 app.get('/api/party', auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
   res.json({ party });
 });
+async function doHeal(owner_id){
+  await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [owner_id]);
+  const party = await getParty(owner_id);
+  return { ok:true, party };
+}
+app.post('/api/heal', auth, async (req,res)=>{ try{ res.json(await doHeal(req.session.player_id)); }catch(e){ res.status(500).json({ error:'server_error' }); }});
+app.get('/api/heal',  auth, async (req,res)=>{ try{ res.json(await doHeal(req.session.player_id)); }catch(e){ res.status(500).json({ error:'server_error' }); }});
 
-/* ---------- heal ---------- */
-app.post('/api/heal', auth, async (req,res)=>{
-  await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [req.session.player_id]);
-  const party = await getParty(req.session.player_id);
-  res.json({ ok:true, party });
+/* ---------- species & chunk ---------- */
+app.get('/api/species', async (_req,res)=>{
+  try{ const { rows } = await pool.query(`SELECT id,name,base_spawn_rate,biomes,types FROM mg_species ORDER BY id ASC`); res.json({ species: rows }); }
+  catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 
-/* ---------- world/chunk, sync, battles ---------- */
-/* ... KEEP THE REST OF THE FILE EXACTLY AS IN THE LAST VERSION I GAVE YOU ...
-   (chunk/species endpoints, /api/move, /api/sync, and all battle routes remain unchanged) */
-// ----- helper: build an encounter table for a generated chunk -----
-async function buildEncounterTableForChunk(cx, cy) {
-  // Generate chunk to analyze its biomes
-  const ch = world.generateChunk(cx, cy);
-  const counts = {};
-  for (const row of ch.tiles) {
-    for (const t of row) {
-      const b = (t && t.biome) || 'unknown';
-      counts[b] = (counts[b] || 0) + 1;
+// helper to get a chunk from `world` in whatever shape the module exposes
+function getWorldChunk(cx, cy){
+  if (world && typeof world.getChunk === 'function') return world.getChunk(cx,cy);
+  if (world && typeof world.chunk === 'function')    return world.chunk(cx,cy);
+  if (world && typeof world.generateChunk === 'function') return world.generateChunk(cx,cy);
+  // fallback flat grassland if world module is different
+  const w=CHUNK_W,h=CHUNK_H;
+  const tiles = Array.from({length:h},()=>Array.from({length:w},()=>({ biome:'grassland' })));
+  return { w,h,tiles };
+}
+function chunkHandler(req,res){
+  try{
+    const cx = parseInt(req.query.x,10)|0;
+    const cy = parseInt(req.query.y,10)|0;
+    const chunk = getWorldChunk(cx,cy);
+    if (!chunk || !Array.isArray(chunk.tiles)) return res.status(500).json({ error:'no_chunk' });
+    res.json({ chunk });
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
+}
+app.get('/api/chunk', auth, chunkHandler);
+// non-API fallback used by old clients
+app.get('/chunk', auth, chunkHandler);
+
+/* ---------- sync (absolute) ---------- */
+app.post('/api/sync', auth, async (req,res)=>{
+  try{
+    const { seq, cx, cy, tx, ty } = req.body || {};
+    if (typeof cx!=='number'||typeof cy!=='number'||typeof tx!=='number'||typeof ty!=='number'){
+      return res.status(400).json({ error:'bad_coords' });
     }
-  }
-  // Dominant biome in this chunk
-  let dominant = 'grassland';
-  let max = -1;
-  for (const [b, c] of Object.entries(counts)) {
-    if (c > max) { max = c; dominant = b; }
-  }
-  // Pull species that can spawn in this biome
-  const { rows } = await pool.query(
-    `SELECT id, name, base_spawn_rate
-       FROM mg_species
-      WHERE $1 = ANY(biomes)
-      ORDER BY id ASC`,
-    [dominant]
-  );
-  // Make a simple weighted table. If none match, fall back to all species.
-  const list = rows.length ? rows : (await pool.query(
-    `SELECT id, name, base_spawn_rate FROM mg_species ORDER BY id ASC`
-  )).rows;
+    // normalize into chunk bounds
+    let n_cx=cx|0, n_cy=cy|0, n_tx=tx|0, n_ty=ty|0;
+    while (n_tx<0){ n_tx+=CHUNK_W; n_cx-=1; }
+    while (n_ty<0){ n_ty+=CHUNK_H; n_cy-=1; }
+    while (n_tx>=CHUNK_W){ n_tx-=CHUNK_W; n_cx+=1; }
+    while (n_ty>=CHUNK_H){ n_ty-=CHUNK_H; n_cy+=1; }
 
-  // Normalize to simple weights for the client (not probabilities)
-  // Weight floor to avoid zeros
-  const table = list.map(s => ({
-    speciesId: Number(s.id),
-    weight: Math.max(1, Math.round((s.base_spawn_rate || 0.05) * 100))
-  }));
+    await setState(req.session.player_id, n_cx,n_cy,n_tx,n_ty);
 
-  return { biome: dominant, table };
+    const player = { handle:req.session.handle, cx:n_cx, cy:n_cy, tx:n_tx, ty:n_ty };
+    const payload = { seq: Number(seq)||0, player };
+
+    // when crossing chunk, include the new chunk so client can draw immediately
+    if (n_cx!== (cx|0) || n_cy!==(cy|0)){
+      payload.chunk = getWorldChunk(n_cx, n_cy);
+    }
+    res.json(payload);
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
+});
+
+/* ---------- battles ---------- */
+// in-memory battle state keyed by session token
+const battles = new Map();
+
+function firstAliveIndex(party){
+  for (let i=0;i<party.length;i++) if ((party[i].hp|0)>0) return i;
+  return -1;
+}
+function calcDamage(move, atkLevel){
+  const power = (move.power|0) || 1;
+  const base = Math.max(1, Math.round(power + atkLevel*0.5));
+  return base;
+}
+function makePPMap(moves){
+  const map={}; (moves||[]).slice(0,4).forEach(m=>{ map[m.name]= (m.pp|0) || 20; }); return map;
 }
 
-// ----- species list (no auth required; safe to cache on client) -----
-app.get('/api/species', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, name, base_spawn_rate AS "baseSpawnRate", biomes, types
-         FROM mg_species
-         ORDER BY id ASC`
-    );
-    res.json({ species: rows });
-  } catch (e) {
-    res.status(500).json({ error: 'server_error' });
-  }
-});
+async function buildEnemyFromTile(tile){
+  // very simple: pick a random species weighted a little by base_spawn_rate
+  const { rows } = await pool.query(`SELECT id,name,base_spawn_rate FROM mg_species ORDER BY id ASC`);
+  if (!rows.length) return { speciesId:1, name:'Fieldling', level:3, hp:20, max_hp:20, moves:[{name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25}] };
+  // weight
+  const w = rows.map(r=>Math.max(0.01, Number(r.base_spawn_rate)||0.05));
+  const sum = w.reduce((a,b)=>a+b,0);
+  let t=Math.random()*sum, pick=rows[0];
+  for(let i=0;i<w.length;i++){ if ((t-=w[i])<=0){ pick = rows[i]; break; } }
+  const level = 2 + Math.floor(Math.random()*3);
+  const hp = 16 + level*4;
+  return {
+    speciesId: pick.id, name: pick.name, level,
+    hp, max_hp: hp,
+    moves: [{ name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25 }]
+  };
+}
 
-// ----- chunk fetch (auth) -----
-app.get('/api/chunk', auth, async (req, res) => {
-  try {
-    // Use requested x,y or the player's current chunk
+app.post('/api/battle/start', auth, async (req,res)=>{
+  try{
+    const party = await getParty(req.session.player_id);
+    const idx = firstAliveIndex(party);
+    if (idx<0) return res.status(409).json({ error:'you_fainted' });
+
     const st = await getState(req.session.player_id);
-    const x = parseInt(req.query.x ?? st.cx, 10);
-    const y = parseInt(req.query.y ?? st.cy, 10);
-    const ch = world.generateChunk(x, y);
-    const enc = await buildEncounterTableForChunk(x, y);
-    res.json({ x, y, chunk: { ...ch, encounterTable: enc.table, biome: enc.biome } });
-  } catch (e) {
-    res.status(500).json({ error: 'server_error' });
-  }
+    const tile = (getWorldChunk(st.cx, st.cy)?.tiles?.[st.ty]||[])[st.tx];
+
+    const enemy = await buildEnemyFromTile(tile);
+    const you = { ...party[idx] }; // shallow
+    const pp = makePPMap(you.moves);
+
+    const battle = { you, enemy, youIndex: idx, pp, log:[`A wild ${enemy.name} appears!`], allowCapture:false, owner_id:req.session.player_id };
+    battles.set(req.session.token, battle);
+
+    res.json({ you, enemy, youIndex: idx, pp, log: battle.log, allowCapture: false });
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 
-// ----- alias without /api for older clients or direct Render base -----
-app.get('/chunk', auth, async (req, res) => {
-  try {
-    const st = await getState(req.session.player_id);
-    const x = parseInt(req.query.x ?? st.cx, 10);
-    const y = parseInt(req.query.y ?? st.cy, 10);
-    const ch = world.generateChunk(x, y);
-    const enc = await buildEncounterTableForChunk(x, y);
-    res.json({ x, y, chunk: { ...ch, encounterTable: enc.table, biome: enc.biome } });
-  } catch (e) {
-    res.status(500).json({ error: 'server_error' });
-  }
+app.post('/api/battle/turn', auth, async (req,res)=>{
+  try{
+    const b = battles.get(req.session.token);
+    if (!b) return res.status(404).json({ error:'no_battle' });
+    const action = (req.body?.action||'').toLowerCase();
+
+    // refresh party entry used for "you" (HP may change between turns due to heal, etc.)
+    const party = await getParty(req.session.player_id);
+    let you = party[b.youIndex] || party[firstAliveIndex(party)];
+    if (!you) return res.status(409).json({ error:'you_team_wiped' });
+    b.you = you; // keep latest
+
+    if (b.allowCapture) return res.status(409).json({ error:'capture_or_finish' });
+
+    if (action === 'switch'){
+      const idx = Math.max(0, Math.min((req.body.index|0), party.length-1));
+      if ((party[idx]?.hp|0)<=0) return res.status(400).json({ error:'target_fainted' });
+      b.youIndex = idx;
+      b.you = party[idx];
+      b.log.push(`You sent out ${b.you.nickname?.trim() || `Your ${b.you.species_id}`}.`);
+      // enemy gets a free small hit on switch (optional: comment this out if undesired)
+      const chip = Math.max(1, Math.floor(b.enemy.max_hp*0.05));
+      b.enemy.hp = Math.max(0, (b.enemy.hp|0) - chip);
+    } else if (action === 'run'){
+      b.log.push(`You ran away.`);
+      battles.delete(req.session.token);
+      return res.json({ log:b.log, result:'escaped' });
+    } else if (action === 'move'){
+      const moveName = String(req.body.move||'').trim();
+      const move = (Array.isArray(b.you.moves)?b.you.moves:[]).find(m=>(m.name||'')===moveName) ||
+                   { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25 };
+      if (b.pp[move.name] == null) b.pp[move.name] = (move.pp|0)||20;
+      if (b.pp[move.name] <= 0) return res.status(400).json({ error:'no_pp' });
+      // accuracy
+      if (Math.random() < (move.accuracy ?? 1.0)){
+        const dmg = calcDamage(move, b.you.level|0);
+        b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
+        b.log.push(`${move.name} hits for ${dmg}!`);
+      } else {
+        b.log.push(`${move.name} missed!`);
+      }
+      b.pp[move.name] = Math.max(0, (b.pp[move.name]|0) - 1);
+
+      // enemy KO check
+      if ((b.enemy.hp|0) <= 0){
+        b.log.push(`Enemy ${b.enemy.name} fainted!`);
+        b.allowCapture = true; // only now can capture
+        return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
+      }
+
+      // enemy's turn (simple strike)
+      if (Math.random() < 0.93){
+        const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+        const cur = Math.max(0, (b.you.hp|0) - edmg);
+        await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [cur, b.you.id, req.session.player_id]);
+        b.you.hp = cur;
+        b.log.push(`${b.enemy.name} strikes back for ${edmg}!`);
+      } else {
+        b.log.push(`${b.enemy.name} missed!`);
+      }
+
+      // you KO check → auto-sub if possible
+      const refreshed = await getParty(req.session.player_id);
+      const idxAlive = firstAliveIndex(refreshed);
+      if ((b.you.hp|0) <= 0){
+        if (idxAlive >= 0){
+          b.youIndex = idxAlive;
+          b.you = refreshed[idxAlive];
+          b.log.push(`Your previous monster fainted! ${b.you.nickname?.trim() || 'Next monster'} steps in.`);
+        } else {
+          battles.delete(req.session.token);
+          return res.json({ log:b.log, result:'you_team_wiped' });
+        }
+      }
+    } else {
+      return res.status(400).json({ error:'bad_action' });
+    }
+
+    res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 
+app.post('/api/battle/capture', auth, async (req,res)=>{
+  try{
+    const b = battles.get(req.session.token);
+    if (!b) return res.status(404).json({ error:'no_battle' });
+    if (!b.allowCapture) return res.status(409).json({ error:'not_allowed' });
 
+    // fixed odds (e.g., 60%) per spec: only after KO
+    const success = Math.random() < 0.6;
+    if (!success){
+      b.log.push('Capture failed.');
+      return res.json({ result:'failed', log:b.log, allowCapture:true });
+    }
+    // Add to party
+    await pool.query(`
+      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
+      VALUES ($1,$2,$3,0,$4,$4,'wild','[
+        {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25}
+      ]'::jsonb)
+    `, [req.session.player_id, b.enemy.speciesId, b.enemy.level|0, Math.max(12, b.enemy.max_hp|0)]);
+
+    b.log.push(`Captured ${b.enemy.name}!`);
+    battles.delete(req.session.token);
+    res.json({ result:'captured', log:b.log });
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
+});
+
+/* ---------- server / ws ---------- */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 wss.on('connection', ws => { ws.isAlive = true; ws.on('pong', ()=>ws.isAlive = true); });
 setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate(); ws.isAlive=false; ws.ping(); }); }, 30000);
+
 server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT));
