@@ -52,6 +52,8 @@ async function initDB(){
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_player_state (player_id INT PRIMARY KEY REFERENCES mg_players(id) ON DELETE CASCADE, cx INT NOT NULL DEFAULT 0, cy INT NOT NULL DEFAULT 0, tx INT NOT NULL DEFAULT 128, ty INT NOT NULL DEFAULT 128, updated_at TIMESTAMPTZ DEFAULT now());`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_species (id INT PRIMARY KEY, name TEXT NOT NULL, base_spawn_rate REAL NOT NULL DEFAULT 0.05, biomes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[], types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]);`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_monsters (id SERIAL PRIMARY KEY, owner_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, species_id INT NOT NULL REFERENCES mg_species(id), nickname TEXT, level INT NOT NULL DEFAULT 1, xp INT NOT NULL DEFAULT 0, hp INT NOT NULL DEFAULT 20, max_hp INT NOT NULL DEFAULT 20, ability TEXT, moves JSONB DEFAULT '[]'::jsonb);`);
+  await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS current_pp JSONB`);
+
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0){
     await pool.query(`
@@ -120,6 +122,31 @@ async function ensureStarterMoves(owner_id){
   }
 }
 
+async function speciesNameById(id){
+  const { rows } = await pool.query(`SELECT name FROM mg_species WHERE id=$1 LIMIT 1`, [id|0]);
+  return rows[0]?.name || `Species ${id||'?'}`;
+}
+async function monName(mon){
+  const nick = (mon?.nickname||'').trim();
+  if (nick) return nick;
+  return await speciesNameById(mon.species_id);
+}
+
+function buildPPFromMoves(mon){
+  const map={}; (Array.isArray(mon.moves)?mon.moves:[]).slice(0,4).forEach(m=>{
+    const n=m?.name; if (!n) return; map[n]=(m.pp|0)||20;
+  }); return map;
+}
+async function getCurrentPP(mon){
+  if (mon.current_pp && typeof mon.current_pp==='object') return mon.current_pp;
+  const map = buildPPFromMoves(mon);
+  await pool.query(`UPDATE mg_monsters SET current_pp=$1 WHERE id=$2`, [map, mon.id]);
+  return map;
+}
+async function setCurrentPP(monId, ownerId, map){
+  await pool.query(`UPDATE mg_monsters SET current_pp=$1 WHERE id=$2 AND owner_id=$3`, [map, monId, ownerId]);
+}
+
 /* ---------- middleware ---------- */
 async function auth(req,res,next){
   try{
@@ -178,6 +205,8 @@ app.get('/api/party', auth, async (req,res)=>{
 });
 async function doHeal(owner_id){
   await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [owner_id]);
+  await pool.query(`UPDATE mg_monsters SET current_pp = NULL WHERE owner_id=$1`, [owner_id]);
+
   const party = await getParty(owner_id);
   return { ok:true, party };
 }
@@ -285,8 +314,9 @@ app.post('/api/battle/start', auth, async (req,res)=>{
     const tile = (getWorldChunk(st.cx, st.cy)?.tiles?.[st.ty]||[])[st.tx];
 
     const enemy = await buildEnemyFromTile(tile);
-    const you = { ...party[idx] }; // shallow
-    const pp = makePPMap(you.moves);
+    const you = { ...party[idx] };
+    const pp = await getCurrentPP(you);
+
 
     const battle = { you, enemy, youIndex: idx, pp, log:[`A wild ${enemy.name} appears!`], allowCapture:false, owner_id:req.session.player_id };
     battles.set(req.session.token, battle);
@@ -340,7 +370,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       // Perform the switch (this consumes your turn)
       b.youIndex = targetIdx;
       b.you = party[targetIdx];
-      b.log.push(`You switched to ${b.you.nickname?.trim() || `Monster #${b.you.id}`}.`);
+      b.pp = await getCurrentPP(b.you);
+
+      b.log.push(`You switched to ${await monName(b.you)}.`);
+
     
       // If NO priority, enemy acts AFTER the switch (hits the new active)
       if (ePri === 0){
@@ -378,6 +411,8 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       const moveName = String(req.body.move||'').trim();
       const move = (Array.isArray(b.you.moves)?b.you.moves:[]).find(m=>(m.name||'')===moveName) ||
                    { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25 };
+      if (!b.pp) b.pp = await getCurrentPP(b.you);
+
       if (b.pp[move.name] == null) b.pp[move.name] = (move.pp|0)||20;
       if (b.pp[move.name] <= 0) return res.status(400).json({ error:'no_pp' });
       // accuracy
@@ -389,10 +424,12 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
         b.log.push(`${move.name} missed!`);
       }
       b.pp[move.name] = Math.max(0, (b.pp[move.name]|0) - 1);
+      await setCurrentPP(b.you.id, req.session.player_id, b.pp);
 
       // enemy KO check
       if ((b.enemy.hp|0) <= 0){
-        b.log.push(`Enemy ${b.enemy.name} fainted!`);
+        b.log.push(`${b.enemy.name} fainted!`);
+
         b.allowCapture = true; // only now can capture
         return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
       }
@@ -413,14 +450,17 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       const idxAlive = firstAliveIndex(refreshed);
       if ((b.you.hp|0) <= 0){
         if (idxAlive >= 0){
+          const prevName = await monName(you); // 'you' is the pre-hit active from above
           b.youIndex = idxAlive;
           b.you = refreshed[idxAlive];
-          b.log.push(`Your previous monster fainted! ${b.you.nickname?.trim() || 'Next monster'} steps in.`);
+          const nextName = await monName(b.you);
+          b.log.push(`${prevName} fainted! ${nextName} steps in.`);
         } else {
           battles.delete(req.session.token);
           return res.json({ log:b.log, result:'you_team_wiped' });
         }
       }
+
     } else {
       return res.status(400).json({ error:'bad_action' });
     }
