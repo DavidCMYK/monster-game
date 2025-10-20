@@ -57,25 +57,21 @@ function sampleFields(wx, wy){
   return { height, moisture, townmask };
 }
 
-// ---- River routing using gradient descent on height ----
 function generateRiversInChunk(cx, cy, tiles, heightFn){
   const W = CHUNK_W, H = CHUNK_H;
-  // Start a few candidate sources in highlands and let them flow downhill.
   const seeds = 6;
   for (let i=0;i<seeds;i++){
     const sx = Math.floor((i+1) * W/(seeds+1));
     const sy = Math.floor( ( (i&1)? H*0.3 : H*0.7 ) );
     let wx = cx*W + sx, wy = cy*H + sy;
 
-    // only start if height is relatively high
     if (heightFn(wx,wy) < 0.55) continue;
 
     let x = sx, y = sy, steps = 0, lastH = heightFn(wx,wy);
     while (steps < W + H) {
-      // mark current as river
       tiles[y][x].biome = (tiles[y][x].biome === 'ocean') ? 'ocean' : 'river';
-      tiles[y][x].encounterRate = Math.max(tiles[y][x].encounterRate, 0.09); // rivers are lively
-      // step to neighbor with lowest height (downhill)
+      tiles[y][x].encounterRate = Math.max(tiles[y][x].encounterRate, 0.09);
+
       let best = { x, y, h: lastH, dx:0, dy:1 };
       for (let dy=-1; dy<=1; dy++){
         for (let dx=-1; dx<=1; dx++){
@@ -88,23 +84,20 @@ function generateRiversInChunk(cx, cy, tiles, heightFn){
         }
       }
       x = best.x; y = best.y; wx = cx*W + x; wy = cy*H + y; lastH = best.h; steps++;
-      // stop if we reached ocean-level
+
       if (lastH < 0.35) break;
-      // small chance to stop early to create lakes
-      if (steps > 40 && Math.random() < 0.02) break;
-      // exit if on border; river will continue in adjacent chunk when that chunk is generated
+      // deterministic early-stop chance (small lakes)
+      if (steps > 40 && rand01(wx + steps, wy - steps, 606) < 0.02) break;
       if (x===0||y===0||x===W-1||y===H-1) break;
     }
   }
 }
 
-// ---- Town stamping (sparse; expands later with growth/decay systems) ----
 function stampTown(tiles, cx, cy, wx, wy){
   const W = CHUNK_W, H = CHUNK_H;
-  // center near (wx,wy) local to chunk
   const lx = wx - cx*W, ly = wy - cy*H;
-  const size = 10 + Math.floor(rand01(wx, wy, 888)*14); // ~10-24 tiles radius-ish footprint
-  
+  const size = 10 + Math.floor(rand01(wx, wy, 888)*14);
+
   for (let y=-size; y<=size; y++){
     for (let x=-size; x<=size; x++){
       const tx = lx + x, ty = ly + y;
@@ -112,19 +105,16 @@ function stampTown(tiles, cx, cy, wx, wy){
       const d = Math.hypot(x,y);
       if (d < size * (0.6 + rand01(wx+x, wy+y, 777)*0.25)) {
         tiles[ty][tx].biome = 'town';
-        tiles[ty][tx].encounterRate = 0.01; // very low in town outdoors as per design
+        tiles[ty][tx].encounterRate = 0.01;
         tiles[ty][tx].z = 0;
       }
     }
   }
 }
 
-// ---- Main chunk generator ----
 function generateChunk(cx, cy){
   const tiles = new Array(CHUNK_H);
   const W = CHUNK_W, H = CHUNK_H;
-
-  // helper to read height via fields
   const heightAt = (wx,wy)=> sampleFields(wx,wy).height;
 
   for (let y=0;y<H;y++){
@@ -133,24 +123,16 @@ function generateChunk(cx, cy){
       const wx = cx*W + x, wy = cy*H + y;
       const { height, moisture, townmask } = sampleFields(wx, wy);
 
-      // Base biome thresholds (tunable; ensure continuity)
       let biome = 'grassland';
-      if (height < 0.34){
-        biome = 'ocean';
-      } else if (height > 0.72){
-        biome = 'mountain';
-      } else {
-        // land band — forest vs grassland by moisture
-        biome = (moisture > 0.55) ? 'forest' : 'grassland';
-      }
+      if (height < 0.34) biome = 'ocean';
+      else if (height > 0.72) biome = 'mountain';
+      else biome = (moisture > 0.55) ? 'forest' : 'grassland';
 
-      // encounter rates per biome (can be tweaked later)
-      let encounterRate = 0.08; // default wilderness
+      let encounterRate = 0.08;
       if (biome === 'ocean')    encounterRate = 0.06;
       if (biome === 'forest')   encounterRate = 0.10;
       if (biome === 'mountain') encounterRate = 0.09;
 
-      // z-hints: ocean < 1, mountains vary, others mild
       let z = 0;
       if (biome === 'ocean') z = -1;
       else if (biome === 'mountain') z = (height > 0.82)? 3 : (height > 0.77 ? 2 : 1);
@@ -160,20 +142,20 @@ function generateChunk(cx, cy){
     }
   }
 
-  // Rivers: carve after base biomes so they overwrite land to 'river'
   generateRiversInChunk(cx, cy, tiles, heightAt);
 
-  // Towns: sparse placement; not contagious to adjacent chunk automatically (growth later)
-  // Chance magnitude can be tuned; start rare
   const wxCenter = cx*W + Math.floor(W/2), wyCenter = cy*H + Math.floor(H/2);
   const { townmask } = sampleFields(wxCenter, wyCenter);
   const townChance = (townmask > 0.73) ? 0.06 : (townmask > 0.67 ? 0.03 : 0.0);
-  if (townChance > 0 && Math.random() < townChance){
-    // pick a dry, non-mountain, non-ocean local spot
+
+  if (townChance > 0 && rand01(cx, cy, 505) < townChance){
     let placed = false;
     for (let i=0;i<8 && !placed;i++){
-      const rx = Math.floor(W* (0.25 + Math.random()*0.5));
-      const ry = Math.floor(H* (0.25 + Math.random()*0.5));
+      // deterministic local placement
+      const r1 = rand01(cx*W + i*7, cy*H + i*11, 707);
+      const r2 = rand01(cx*W + i*13, cy*H + i*17, 717);
+      const rx = Math.floor(W * (0.25 + r1*0.5));
+      const ry = Math.floor(H * (0.25 + r2*0.5));
       if (tiles[ry][rx].biome !== 'ocean' && tiles[ry][rx].biome !== 'mountain' && tiles[ry][rx].biome !== 'river'){
         stampTown(tiles, cx, cy, cx*W + rx, cy*H + ry);
         placed = true;
@@ -181,12 +163,8 @@ function generateChunk(cx, cy){
     }
   }
 
-  // Return with width/height and tiles array
   return { w: W, h: H, tiles };
 }
 
-module.exports = {
-  CHUNK_W, CHUNK_H,
-  generateChunk
-};
+module.exports = { CHUNK_W, CHUNK_H, generateChunk };
 
