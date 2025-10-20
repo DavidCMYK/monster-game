@@ -310,14 +310,66 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     if (b.allowCapture) return res.status(409).json({ error:'capture_or_finish' });
 
     if (action === 'switch'){
-      const idx = Math.max(0, Math.min((req.body.index|0), party.length-1));
-      if ((party[idx]?.hp|0)<=0) return res.status(400).json({ error:'target_fainted' });
-      b.youIndex = idx;
-      b.you = party[idx];
-      b.log.push(`You sent out ${b.you.nickname?.trim() || `Your ${b.you.species_id}`}.`);
-      // enemy gets a free small hit on switch (optional: comment this out if undesired)
-      const chip = Math.max(1, Math.floor(b.enemy.max_hp*0.05));
-      b.enemy.hp = Math.max(0, (b.enemy.hp|0) - chip);
+      const curIdx   = b.youIndex|0;
+      const targetIdx= Math.max(0, Math.min((req.body.index|0), party.length-1));
+      if (!party[targetIdx]) return res.status(400).json({ error:'bad_index' });
+      if ((party[targetIdx].hp|0) <= 0) return res.status(400).json({ error:'target_fainted' });
+    
+      // Enemy priority: act BEFORE the switch if priority > 0
+      const eMove = (Array.isArray(b.enemy.moves) && b.enemy.moves[0]) ||
+                    { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25, priority:0 };
+      const ePri  = (eMove.priority|0) || 0;
+    
+      if (ePri > 0){
+        if (Math.random() < (eMove.accuracy ?? 1.0)){
+          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const newHp = Math.max(0, (party[curIdx].hp|0) - edmg);
+          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, party[curIdx].id, req.session.player_id]);
+          party[curIdx].hp = newHp;
+          b.log.push(`${b.enemy.name} (priority) hits for ${edmg}!`);
+        } else {
+          b.log.push(`${b.enemy.name} (priority) missed!`);
+        }
+        const refreshed = await getParty(req.session.player_id);
+        if (firstAliveIndex(refreshed) < 0){
+          battles.delete(req.session.token);
+          return res.json({ log:b.log, result:'you_team_wiped' });
+        }
+      }
+    
+      // Perform the switch (this consumes your turn)
+      b.youIndex = targetIdx;
+      b.you = party[targetIdx];
+      b.log.push(`You switched to ${b.you.nickname?.trim() || `Monster #${b.you.id}`}.`);
+    
+      // If NO priority, enemy acts AFTER the switch (hits the new active)
+      if (ePri === 0){
+        if (Math.random() < (eMove.accuracy ?? 1.0)){
+          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const newHp = Math.max(0, (b.you.hp|0) - edmg);
+          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
+          b.you.hp = newHp;
+          b.log.push(`${b.enemy.name} strikes for ${edmg}!`);
+        } else {
+          b.log.push(`${b.enemy.name} missed!`);
+        }
+    
+        // KO check after being hit post-switch → auto-sub or wipe
+        const refreshed = await getParty(req.session.player_id);
+        const idxAlive = firstAliveIndex(refreshed);
+        if ((b.you.hp|0) <= 0){
+          if (idxAlive >= 0){
+            b.youIndex = idxAlive;
+            b.you = refreshed[idxAlive];
+            b.log.push(`Your switched-in monster fainted! ${b.you.nickname?.trim() || 'Next monster'} steps in.`);
+          } else {
+            battles.delete(req.session.token);
+            return res.json({ log:b.log, result:'you_team_wiped' });
+          }
+        }
+      }
+    
+      return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
     } else if (action === 'run'){
       b.log.push(`You ran away.`);
       battles.delete(req.session.token);
