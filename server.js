@@ -1,4 +1,5 @@
-// server.js — Monster Game backend (Postgres) — 256×256 chunks + read-only sync + chunk caching
+// server.js — Monster Game backend (Postgres)
+// 256×256 chunks • LRU chunk cache • seq-aware sync that supports dx/dy OR absolute coords
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -33,10 +34,10 @@ const CHUNK_W = 256;
 const CHUNK_H = 256;
 
 /* -------------------- IN-MEM STATE -------------------- */
-// Last processed sequence per token (for diagnostics) + last accepted position
+// Tracks last processed seq and last accepted pos per session token
 const SYNC_STATE = new Map(); // token -> { lastSeq: number, lastPos: { cx, cy, tx, ty } }
 
-// LRU caches
+// LRU caches to avoid regenerating chunks/encounters constantly
 const CHUNK_CACHE_MAX = 128;
 const CHUNK_CACHE = new Map();     // key: `${cx},${cy}` -> { w,h,tiles }
 const ENCOUNTER_CACHE = new Map(); // key: `${cx},${cy}` -> encounterTable
@@ -57,6 +58,9 @@ function getChunkCached(cx, cy){
   return gen;
 }
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+function toWorldXY(cx, cy, tx, ty){ return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty }; }
+function manhattan(wx1, wy1, wx2, wy2){ return Math.abs(wx1 - wx2) + Math.abs(wy1 - wy2); }
+function clamp(n,min,max){ return n<min?min:(n>max?max:n); }
 
 /* -------------------- DB INIT + NORMALIZE -------------------- */
 async function normalizePlayerPositions() {
@@ -323,35 +327,91 @@ app.post('/api/move', auth, async (req,res)=>{
 
   await setState(req.session.player_id, cx, cy, tx, ty);
 
-  const tokenStr = req.session.token;
-  const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
+  // remember lastPos for this token (helps seq logic)
+  const rec = SYNC_STATE.get(req.session.token) || { lastSeq: 0, lastPos: null };
   rec.lastPos = { cx, cy, tx, ty };
-  SYNC_STATE.set(tokenStr, rec);
+  SYNC_STATE.set(req.session.token, rec);
 
   const chunk = getChunkCached(cx, cy);
   const encounterTable = await getEncounterTableCached(cx, cy);
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- SYNC (read-only / authoritative) -------------------- */
-// Ignores client-sent coords; just returns server state (prevents oscillation).
+/* -------------------- SYNC (accepts dx/dy OR absolute; seq-aware) -------------------- */
 app.post('/api/sync', auth, async (req,res)=>{
-  const seq = Number(req.body?.seq) || 0;
   const tokenStr = req.headers.authorization || req.query.token;
   const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
+  const seq = Number(req.body?.seq) || 0;
 
-  // record last seen seq (for diagnostics only)
-  if (seq > rec.lastSeq) {
-    rec.lastSeq = seq;
-    SYNC_STATE.set(tokenStr, rec);
+  // If stale or duplicate seq, just return current server state
+  if (seq && seq <= rec.lastSeq){
+    const st0 = rec.lastPos || await getState(req.session.player_id);
+    const chunk0 = getChunkCached(st0.cx, st0.cy);
+    const table0 = await getEncounterTableCached(st0.cx, st0.cy);
+    return res.json({
+      seq: rec.lastSeq,
+      player: { handle: req.session.handle, cx: st0.cx, cy: st0.cy, tx: st0.tx, ty: st0.ty, party: await getParty(req.session.player_id) },
+      chunk: { ...chunk0, encounterTable: table0 }
+    });
   }
 
+  // Start from authoritative state
   const st = await getState(req.session.player_id);
-  const chunk = getChunkCached(st.cx, st.cy);
-  const encounterTable = await getEncounterTableCached(st.cx, st.cy);
+  let { cx, cy, tx, ty } = st;
+
+  // 1) Relative move support (dx/dy)
+  const hasDxDy = typeof req.body?.dx !== 'undefined' || typeof req.body?.dy !== 'undefined';
+  if (hasDxDy){
+    const dx = Math.max(-1, Math.min(1, Number(req.body.dx) || 0));
+    const dy = Math.max(-1, Math.min(1, Number(req.body.dy) || 0));
+
+    tx += dx; ty += dy;
+    if (tx < 0){ tx = CHUNK_W-1; cx -= 1; }
+    if (tx >= CHUNK_W){ tx = 0; cx += 1; }
+    if (ty < 0){ ty = CHUNK_H-1; cy -= 1; }
+    if (ty >= CHUNK_H){ ty = 0; cy += 1; }
+
+    await setState(req.session.player_id, cx, cy, tx, ty);
+  } else {
+    // 2) Absolute coords (cx,cy,tx,ty) — accept with a soft distance guard
+    const hasAbs =
+      Number.isInteger(Number(req.body?.cx)) &&
+      Number.isInteger(Number(req.body?.cy)) &&
+      Number.isInteger(Number(req.body?.tx)) &&
+      Number.isInteger(Number(req.body?.ty));
+
+    if (hasAbs){
+      let ncx = Number(req.body.cx), ncy = Number(req.body.cy), ntx = Number(req.body.tx), nty = Number(req.body.ty);
+
+      // normalize 0..255 with carry
+      while (ntx < 0){ ntx += CHUNK_W; ncx -= 1; }
+      while (nty < 0){ nty += CHUNK_H; ncy -= 1; }
+      while (ntx >= CHUNK_W){ ntx -= CHUNK_W; ncx += 1; }
+      while (nty >= CHUNK_H){ nty -= CHUNK_H; ncy += 1; }
+
+      const from = toWorldXY(cx, cy, tx, ty);
+      const to   = toWorldXY(ncx, ncy, ntx, nty);
+      const seqDelta = Math.max(1, seq - rec.lastSeq);
+      const maxDist = Math.min(64, 4 + 4*seqDelta);
+
+      if (manhattan(from.wx, from.wy, to.wx, to.wy) <= maxDist){
+        cx = ncx; cy = ncy; tx = ntx; ty = nty;
+        await setState(req.session.player_id, cx, cy, tx, ty);
+      }
+      // else: ignore big jump; fall through and return current st
+    }
+    // else: no movement fields — just return current st
+  }
+
+  // update seq + lastPos
+  const lastPos = { cx, cy, tx, ty };
+  SYNC_STATE.set(tokenStr, { lastSeq: seq || rec.lastSeq, lastPos });
+
+  const chunk = getChunkCached(cx, cy);
+  const encounterTable = await getEncounterTableCached(cx, cy);
   res.json({
-    seq: rec.lastSeq,
-    player: { handle: req.session.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party: await getParty(req.session.player_id) },
+    seq: (seq || rec.lastSeq),
+    player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) },
     chunk: { ...chunk, encounterTable }
   });
 });
@@ -369,7 +429,6 @@ app.get('/api/species', auth, async (req,res)=>{
 /* -------------------- BATTLE (wild) -------------------- */
 const battles = new Map();
 function rnd(){ return Math.random(); }
-function clamp(n,min,max){ return n<min?min:(n>max?max:n); }
 function calcDamage(attacker, move, defender){
   const base = move.power || 8;
   const atk = 10 + attacker.level * 2;
