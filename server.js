@@ -1,6 +1,4 @@
-// server.js — Fast-boot Render deploys: app listens immediately; DB init runs in background.
-// Movement + endpoints match your previously working behavior (no ping-pong).
-
+// server.js — Fast-boot + client-authoritative movement via /api/sync (normalize only)
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -29,7 +27,6 @@ const pool = new Pool({
   password: PGPASSWORD,
   port: Number(PGPORT),
   ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-  // keep connection attempts snappy so boot isn't blocked
   connectionTimeoutMillis: 4000,
   idleTimeoutMillis: 30000
 });
@@ -39,13 +36,10 @@ const CHUNK_W = 256;
 const CHUNK_H = 256;
 
 /* -------------------- BOOT READINESS -------------------- */
-let DB_READY = false;            // flips true once tables exist
-let DB_ERROR = null;             // last init error (if any)
-
-// Gate mutating/game routes until DB is ready
-function ensureReady(req, res, next){
+let DB_READY = false;
+let DB_ERROR = null;
+function ensureReady(req,res,next){
   if (DB_READY) return next();
-  // allow health checks even before DB_READY
   if (req.path === '/' || req.path === '/api/health') return next();
   return res.status(503).json({ warming_up: true });
 }
@@ -71,7 +65,6 @@ async function normalizePlayerPositions() {
   `);
   console.log('✓ Normalization pass complete (256×256).');
 }
-
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_players (
@@ -122,7 +115,6 @@ async function initDB() {
       moves JSONB DEFAULT '[]'::jsonb
     );
   `);
-
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0) {
     await pool.query(`
@@ -132,32 +124,23 @@ async function initDB() {
         (4, 'Cliffpup',  0.08, ARRAY['mountain','grassland'],   ARRAY['fauna','earth']);
     `);
   }
-
   await normalizePlayerPositions();
 }
-
-/* Kick off DB init in the background */
-(async ()=>{
-  try{
-    await initDB();
-    DB_READY = true;
-    DB_ERROR = null;
-    console.log('✓ DB ready');
-  }catch(e){
-    DB_ERROR = String(e && e.message || e);
+(async()=>{
+  try { await initDB(); DB_READY = true; DB_ERROR = null; console.log('✓ DB ready'); }
+  catch(e){
+    DB_ERROR = String(e?.message || e);
     console.error('DB init failed (non-fatal boot):', e);
-    // Retry a few times in background if DB is still waking
     let attempts = 0;
     while (!DB_READY && attempts < 5){
-      attempts++;
-      await new Promise(r=>setTimeout(r, 3000));
-      try{ await initDB(); DB_READY = true; console.log('✓ DB ready (after retry)'); }
-      catch(err){ console.error('Retry DB init failed:', err); DB_ERROR = String(err && err.message || err); }
+      attempts++; await new Promise(r=>setTimeout(r, 3000));
+      try { await initDB(); DB_READY = true; console.log('✓ DB ready (after retry)'); }
+      catch(err){ console.error('Retry DB init failed:', err); DB_ERROR = String(err?.message || err); }
     }
   }
 })();
 
-/* -------------------- SIMPLE QUERIES -------------------- */
+/* -------------------- BASIC QUERIES -------------------- */
 async function getPlayerByEmail(email){
   const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]);
   return rows[0] || null;
@@ -175,7 +158,7 @@ async function createPlayer(email, handle, password){
   const player_id = rows[0].id;
   await pool.query(
     `INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,$2,$3)`,
-    [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]
+    [player_id, 128, 128]
   );
   await pool.query(`
     INSERT INTO mg_monsters (owner_id, species_id, level, xp, hp, max_hp, ability, moves)
@@ -251,17 +234,11 @@ async function buildEncounterTableForChunk(cx, cy){
 }
 
 /* -------------------- BASIC -------------------- */
-// Fast health check that doesn't touch DB → lets Render mark deploy "live" immediately.
 app.get('/', (req,res)=>res.type('text').send('Monster Game API online'));
 app.get('/api/health', async (req,res)=>{
-  // dbReady: true when init has completed; include last error if any
   if (!DB_READY) return res.json({ ok: true, dbReady: false, lastError: DB_ERROR });
-  try {
-    const { rows } = await pool.query('SELECT 1 AS ok');
-    res.json({ ok: rows[0].ok === 1, dbReady: true });
-  } catch (e){
-    res.status(500).json({ ok:false, dbReady: true, db_error: e.code || String(e) });
-  }
+  try { const { rows } = await pool.query('SELECT 1 AS ok'); res.json({ ok: rows[0].ok === 1, dbReady: true }); }
+  catch (e){ res.status(500).json({ ok:false, dbReady:true, db_error: e.code || String(e) }); }
 });
 
 /* -------------------- AUTH -------------------- */
@@ -271,7 +248,6 @@ app.post('/api/register', ensureReady, async (req,res)=>{
     if (!email || !password || !handle) return res.status(400).json({ error:'Missing fields' });
     if (await getPlayerByEmail(email))  return res.status(409).json({ error:'Email already exists' });
     if (await getPlayerByHandle(handle))return res.status(409).json({ error:'Handle already exists' });
-
     const player_id = await createPlayer(email, handle, password);
     const tok = await createSession(player_id);
     const st = await getState(player_id);
@@ -279,7 +255,6 @@ app.post('/api/register', ensureReady, async (req,res)=>{
     return res.json({ token: tok, player: { handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
   } catch(e){ console.error('register error', e); return res.status(500).json({ error:'server_error' }); }
 });
-
 app.post('/api/login', ensureReady, async (req,res)=>{
   try{
     const { email, password } = req.body || {};
@@ -315,52 +290,37 @@ app.get('/api/chunk', ensureReady, auth, async (req,res)=>{
   res.json({ x, y, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- MOVE (relative) -------------------- */
+/* -------------------- MOVE (not used by your client, still supported) -------------------- */
 app.post('/api/move', ensureReady, auth, async (req,res)=>{
   const dx = Math.max(-1, Math.min(1, (req.body?.dx) || 0));
   const dy = Math.max(-1, Math.min(1, (req.body?.dy) || 0));
   const st = await getState(req.session.player_id);
   let { cx, cy, tx, ty } = st;
-
   tx += dx; ty += dy;
   if (tx < 0){ tx = CHUNK_W-1; cx -= 1; }
   if (tx >= CHUNK_W){ tx = 0; cx += 1; }
   if (ty < 0){ ty = CHUNK_H-1; cy -= 1; }
   if (ty >= CHUNK_H){ ty = 0; cy += 1; }
-
   await setState(req.session.player_id, cx, cy, tx, ty);
   const chunk = world.generateChunk(cx, cy);
   const encounterTable = await buildEncounterTableForChunk(cx, cy);
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- SYNC (absolute coords accepted; small anti-teleport) -------------------- */
-function worldTiles(cx, cy, tx, ty){
-  return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
-}
+/* -------------------- SYNC — client-authoritative ABSOLUTE coords -------------------- */
 app.post('/api/sync', ensureReady, auth, async (req,res)=>{
   let { cx, cy, tx, ty, seq } = req.body || {};
   cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty); seq = Number(seq) || 0;
   if (!Number.isInteger(cx)||!Number.isInteger(cy)||!Number.isInteger(tx)||!Number.isInteger(ty)){
     return res.status(400).json({ error:'bad_coords' });
   }
-
-  // Normalize 0..255 and carry chunk coords
+  // normalize into 0..255 carrying chunk coords
   while (tx < 0){ tx += CHUNK_W; cx -= 1; }
   while (ty < 0){ ty += CHUNK_H; cy -= 1; }
   while (tx >= CHUNK_W){ tx -= CHUNK_W; cx += 1; }
   while (ty >= CHUNK_H){ ty -= CHUNK_H; cy += 1; }
 
-  const st = await getState(req.session.player_id);
-  const prev = worldTiles(st.cx, st.cy, st.tx, st.ty);
-  const next = worldTiles(cx, cy, tx, ty);
-  const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
-
-  if (dist > 64){
-    cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
-  } else {
-    await setState(req.session.player_id, cx, cy, tx, ty);
-  }
+  await setState(req.session.player_id, cx, cy, tx, ty);
 
   const chunk = world.generateChunk(cx, cy);
   const encounterTable = await buildEncounterTableForChunk(cx, cy);
@@ -403,43 +363,32 @@ function levelUp(mon){
   }
   return false;
 }
-
 app.post('/api/battle/start', ensureReady, auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
   const table = await buildEncounterTableForChunk(st.cx, st.cy);
-
   let total=0; const bag=[];
   for (const e of table){ total += e.baseSpawnRate; bag.push([e, e.baseSpawnRate]); }
   let r = rnd()*total, chosen = bag[0][0];
   for (const [e,w] of bag){ r -= w; if (r<=0){ chosen=e; break; } }
-
   const enemy = { speciesId: chosen.speciesId, level: 1 + Math.floor(rnd()*5) };
   enemy.max_hp = 16 + enemy.level*4;
   enemy.hp = enemy.max_hp;
-
   const party = await getParty(req.session.player_id);
   if (!party.length) return res.status(400).json({ error:'no_party' });
   const you = { ...party[0] };
-
   const battle = { player_id: req.session.player_id, you, enemy, log: [] };
   battles.set(req.session.token, battle);
   res.json({ you, enemy, log: battle.log });
 });
-
 app.post('/api/battle/turn', ensureReady, auth, async (req,res)=>{
   const b = battles.get(req.session.token);
   if (!b) return res.status(400).json({ error:'no_battle' });
   const action = req.body?.action;
-
-  const you = b.you;
-  const enemy = b.enemy;
-
+  const you = b.you, enemy = b.enemy;
   if (action === 'run'){
     if (Math.random() < 0.8){ battles.delete(req.session.token); return res.json({ result:'escaped', you, enemy, log:['You fled.']}); }
-    b.log.push('Could not escape!');
-    return res.json({ you, enemy, log: b.log });
+    b.log.push('Could not escape!'); return res.json({ you, enemy, log: b.log });
   }
-
   if (action === 'move'){
     const moveName = req.body?.move || 'Strike';
     const mv = (you.moves || []).find(m=> (m.name||'').toLowerCase() === moveName.toLowerCase()) || { name:'Strike', power:8, accuracy:0.95 };
@@ -447,9 +396,7 @@ app.post('/api/battle/turn', ensureReady, auth, async (req,res)=>{
       const dmg = calcDamage(you, mv, enemy);
       enemy.hp = clamp(enemy.hp - dmg, 0, enemy.max_hp);
       b.log.push(`You used ${mv.name}. It dealt ${dmg}.`);
-    } else {
-      b.log.push(`Your ${mv.name} missed.`);
-    }
+    } else { b.log.push(`Your ${mv.name} missed.`); }
     if (enemy.hp <= 0){
       you.xp += enemy.level * 10;
       const leveled = levelUp(you);
@@ -457,25 +404,18 @@ app.post('/api/battle/turn', ensureReady, auth, async (req,res)=>{
         [you.level, you.xp, you.hp, you.max_hp, you.id, req.session.player_id]);
       return res.json({ result:'enemy_down', you, enemy, log: b.log, canCapture:true });
     }
-
     if (enemy.hp > 0){
       const em = { name:'Bite', power:7, accuracy:0.9 };
       if (Math.random() < em.accuracy){
         const dmg2 = calcDamage(enemy, em, you);
         you.hp = clamp(you.hp - dmg2, 0, you.max_hp);
         b.log.push(`Enemy used ${em.name}. You took ${dmg2}.`);
-      } else {
-        b.log.push('Enemy missed.');
-      }
+      } else { b.log.push('Enemy missed.'); }
       await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [you.hp, you.id, req.session.player_id]);
-      if (you.hp <= 0){
-        battles.delete(req.session.token);
-        return res.json({ result:'you_down', you, enemy, log: b.log });
-      }
+      if (you.hp <= 0){ battles.delete(req.session.token); return res.json({ result:'you_down', you, enemy, log: b.log }); }
     }
     return res.json({ you, enemy, log: b.log });
   }
-
   return res.status(400).json({ error:'bad_action' });
 });
 
@@ -487,5 +427,4 @@ setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate
 
 /* -------------------- BOOT -------------------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-// LISTEN FIRST → lets Render mark the service “live” quickly
 server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT));
