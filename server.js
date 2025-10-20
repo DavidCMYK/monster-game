@@ -1,4 +1,4 @@
-// server.js — Fast boot + client-authoritative /api/sync + robust encounters + capture
+// server.js — client-authoritative /api/sync + capture + robust encounters + session resume/logout
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -182,6 +182,9 @@ async function getSession(tokenStr){
   );
   return rows[0] || null;
 }
+async function deleteSession(tokenStr){
+  await pool.query(`DELETE FROM mg_sessions WHERE token=$1`, [tokenStr]);
+}
 async function getState(player_id){
   const { rows } = await pool.query(
     `SELECT player_id, cx, cy, tx, ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`,
@@ -270,13 +273,13 @@ app.post('/api/login', ensureReady, async (req,res)=>{
     if (!ok) return res.status(401).json({ error:'Invalid credentials' });
     const tok = await createSession(p.id);
     const st = await getState(p.id);
-    await ensureHasParty(p.id); // make sure legacy users have a starter
+    await ensureHasParty(p.id);
     const party = await getParty(p.id);
     return res.json({ token: tok, player: { handle: p.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
   } catch(e){ console.error('login error', e); return res.status(500).json({ error:'server_error' }); }
 });
 
-/* -------------------- AUTH MIDDLEWARE -------------------- */
+/* Session resume + logout */
 async function auth(req,res,next){
   try{
     const t = req.headers.authorization || req.query.token;
@@ -286,6 +289,18 @@ async function auth(req,res,next){
     req.session = sess; next();
   } catch{ return res.status(500).json({ error:'server_error' }); }
 }
+app.get('/api/session', ensureReady, auth, async (req,res)=>{
+  const st = await getState(req.session.player_id);
+  const party = await getParty(req.session.player_id);
+  return res.json({
+    token: req.session.token,
+    player: { handle: req.session.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party }
+  });
+});
+app.post('/api/logout', ensureReady, auth, async (req,res)=>{
+  await deleteSession(req.session.token);
+  return res.json({ ok: true });
+});
 
 /* -------------------- CHUNK -------------------- */
 app.get('/api/chunk', ensureReady, auth, async (req,res)=>{
@@ -371,12 +386,11 @@ function levelUp(mon){
 
 app.post('/api/battle/start', ensureReady, auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
-  await ensureHasParty(req.session.player_id);                   // guarantee a starter exists
+  await ensureHasParty(req.session.player_id);
   const party = await getParty(req.session.player_id);
   if (!party.length) return res.status(400).json({ error:'no_party_after_seed' });
 
   const table = await buildEncounterTableForChunk(st.cx, st.cy);
-  // Safe pick even if table is somehow empty
   let chosen = table[0] || { speciesId: 1, name:'Fieldling', baseSpawnRate:1.0, biomes:['grassland'] };
   if (table.length > 1){
     let total = 0; for (const e of table) total += (e.baseSpawnRate || 0);
@@ -392,7 +406,6 @@ app.post('/api/battle/start', ensureReady, auth, async (req,res)=>{
   const you = { ...party[0] };
   const battle = { player_id: req.session.player_id, you, enemy, log: [], finished: false };
   battles.set(req.session.token, battle);
-  // include a tiny debug breadcrumb so we can verify server side is OK
   res.json({ you, enemy, log: battle.log, _dbg: { tableLen: table.length, chosen: chosen.speciesId } });
 });
 
