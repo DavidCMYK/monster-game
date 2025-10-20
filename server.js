@@ -95,9 +95,14 @@ async function deleteSession(tok){ await pool.query(`DELETE FROM mg_sessions WHE
 async function getState(player_id){ const { rows } = await pool.query(`SELECT player_id,cx,cy,tx,ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`, [player_id]); return rows[0]||null; }
 async function setState(player_id,cx,cy,tx,ty){ await pool.query(`UPDATE mg_player_state SET cx=$1,cy=$2,tx=$3,ty=$4,updated_at=now() WHERE player_id=$5`,[cx,cy,tx,ty,player_id]); }
 async function getParty(player_id){
-  const { rows } = await pool.query(`SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 6`, [player_id]);
+  const { rows } = await pool.query(
+    `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,current_pp
+     FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 6`,
+    [player_id]
+  );
   return rows;
 }
+
 async function ensureHasParty(owner_id){
   const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
   if ((rows[0]?.c||0) === 0){
@@ -137,12 +142,22 @@ function buildPPFromMoves(mon){
     const n=m?.name; if (!n) return; map[n]=(m.pp|0)||20;
   }); return map;
 }
+
 async function getCurrentPP(mon){
-  if (mon.current_pp && typeof mon.current_pp==='object') return mon.current_pp;
-  const map = buildPPFromMoves(mon);
-  await pool.query(`UPDATE mg_monsters SET current_pp=$1 WHERE id=$2`, [map, mon.id]);
+  if (mon.current_pp && typeof mon.current_pp === 'object') return mon.current_pp;
+  const { rows } = await pool.query(`SELECT current_pp, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [mon.id]);
+  let map = rows[0]?.current_pp;
+  if (!map || typeof map !== 'object') {
+    const moves = rows[0]?.moves || mon.moves;
+    map = {};
+    (Array.isArray(moves)?moves:[]).slice(0,4).forEach(m=>{
+      const n=m?.name; if (!n) return; map[n]=(m.pp|0)||20;
+    });
+    await pool.query(`UPDATE mg_monsters SET current_pp=$1 WHERE id=$2`, [map, mon.id]);
+  }
   return map;
 }
+
 async function setCurrentPP(monId, ownerId, map){
   await pool.query(`UPDATE mg_monsters SET current_pp=$1 WHERE id=$2 AND owner_id=$3`, [map, monId, ownerId]);
 }
