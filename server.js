@@ -1,4 +1,4 @@
-// server.js — Postgres, server-side encounters + battles + capture + party
+// server.js — Postgres, server-side encounters + battles + capture + party (256×256 chunks per spec)
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -50,8 +50,8 @@ async function initDB() {
       player_id INT PRIMARY KEY REFERENCES mg_players(id) ON DELETE CASCADE,
       cx INT NOT NULL DEFAULT 0,
       cy INT NOT NULL DEFAULT 0,
-      tx INT NOT NULL DEFAULT 128,
-      ty INT NOT NULL DEFAULT 128,
+      tx INT NOT NULL DEFAULT 128,  -- center of 256 grid
+      ty INT NOT NULL DEFAULT 128,  -- center of 256 grid
       updated_at TIMESTAMPTZ DEFAULT now()
     );
   `);
@@ -90,8 +90,11 @@ async function initDB() {
 }
 
 /* -------------------- UTIL / AUTH -------------------- */
+// Must match world.generateChunk() and client logic
+const CHUNK_W = 256;
+const CHUNK_H = 256;
+
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-const CHUNK_W = 256, CHUNK_H = 256;
 
 async function getPlayerByEmail(email){
   const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email = $1 LIMIT 1`, [email]);
@@ -109,8 +112,8 @@ async function createPlayer(email, handle, password){
   );
   const player_id = rows[0].id;
   await pool.query(
-    `INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,128,128)`,
-    [player_id]
+    `INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,$2,$3)`,
+    [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]
   );
   await pool.query(`
     INSERT INTO mg_monsters (owner_id, species_id, level, xp, hp, max_hp, ability, moves)
@@ -212,8 +215,7 @@ async function buildEncounterTableForChunk(cx, cy){
   }
   function biomeWeightFor(spec){
     if (!spec.biomes || spec.biomes.length===0) return 0.5;
-    let w=0;
-    for (const b of spec.biomes){ if (counts[b]) w += counts[b]; }
+    let w=0; for (const b of spec.biomes){ if (counts[b]) w += counts[b]; }
     const total = Object.values(counts).reduce((a,n)=>a+n,1) || 1;
     return w/total;
   }
@@ -242,9 +244,8 @@ app.get('/api/chunk', auth, async (req,res)=>{
   res.json({ x, y, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- LEGACY MOVE (kept) -------------------- */
+/* -------------------- MOVE (kept for compatibility) -------------------- */
 app.post('/api/move', auth, async (req,res)=>{
-  // Single-step authoritative move (kept for compatibility)
   const dx = Math.max(-1, Math.min(1, (req.body?.dx) || 0));
   const dy = Math.max(-1, Math.min(1, (req.body?.dy) || 0));
   const st = await getState(req.session.player_id);
@@ -262,19 +263,18 @@ app.post('/api/move', auth, async (req,res)=>{
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- NEW: ABSOLUTE SYNC -------------------- */
+/* -------------------- ABSOLUTE SYNC (256×256) -------------------- */
 function worldTiles(cx, cy, tx, ty){
   return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
 }
 app.post('/api/sync', auth, async (req,res)=>{
-  // Client sends absolute position; we validate and accept to avoid rubber-banding.
   let { cx, cy, tx, ty } = req.body || {};
   cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty);
   if (!Number.isInteger(cx)||!Number.isInteger(cy)||!Number.isInteger(tx)||!Number.isInteger(ty)){
     return res.status(400).json({ error:'bad_coords' });
   }
 
-  // Clamp tx/ty into 0..CHUNK-1 and carry into chunk coords (edge crossings)
+  // Normalize into 0..255 and carry into chunk coords
   while (tx < 0){ tx += CHUNK_W; cx -= 1; }
   while (ty < 0){ ty += CHUNK_H; cy -= 1; }
   while (tx >= CHUNK_W){ tx -= CHUNK_W; cx += 1; }
@@ -285,8 +285,9 @@ app.post('/api/sync', auth, async (req,res)=>{
   const next = worldTiles(cx, cy, tx, ty);
   const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
 
-  // Anti-teleport: allow reasonable distance per tick burst (batched client sends).
-  if (dist > 16){ // >16 tiles since last save is suspicious; clamp to previous state
+  // We sync every step, allow small bursts; clamp only if absurd
+  const MAX_ALLOWED = 32; // tiles since last save
+  if (dist > MAX_ALLOWED){
     cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
   }
 
@@ -312,10 +313,6 @@ function calcDamage(attacker, move, defender){
   const def = 8  + defender.level * 2;
   const variance = 0.9 + rnd()*0.2;
   return Math.max(1, Math.floor(((base + atk*0.5) - def*0.35) * variance));
-}
-function hitCheck(attacker, move, defender){
-  const acc = (move.accuracy ?? 0.95);
-  return rnd() < acc;
 }
 function levelUp(mon){
   const need = 20 + mon.level * 10;
@@ -360,7 +357,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
   const enemy = b.enemy;
 
   if (action === 'run'){
-    if (rnd() < 0.8){ battles.delete(req.session.token); return res.json({ result:'escaped', you, enemy, log:['You fled.']}); }
+    if (Math.random() < 0.8){ battles.delete(req.session.token); return res.json({ result:'escaped', you, enemy, log:['You fled.']}); }
     b.log.push('Could not escape!');
     return res.json({ you, enemy, log: b.log });
   }
@@ -368,7 +365,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
   if (action === 'move'){
     const moveName = req.body?.move || 'Strike';
     const mv = (you.moves || []).find(m=> (m.name||'').toLowerCase() === moveName.toLowerCase()) || { name:'Strike', power:8, accuracy:0.95 };
-    if (hitCheck(you, mv, enemy)){
+    if ((Math.random()) < (mv.accuracy ?? 0.95)){
       const dmg = calcDamage(you, mv, enemy);
       enemy.hp = clamp(enemy.hp - dmg, 0, enemy.max_hp);
       b.log.push(`You used ${mv.name}. It dealt ${dmg}.`);
@@ -424,7 +421,7 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
         {"name":"Tackle","base":"physical","power":6,"accuracy":0.95,"pp":30,"stack":["dmg_phys"]}
       ]'::jsonb)
       RETURNING id, species_id, level, xp, hp, max_hp, ability, moves
-    `, [req.session.player_id, b.enemy.speciesId, lvl, max_hp, max_hp]);
+    `, [req.session.player_id, b.enemy.speciesId, Math.max(1, b.enemy.level), max_hp, max_hp]);
     battles.delete(req.session.token);
     return res.json({ result:'captured', captured: rows[0] });
   } else {
@@ -439,7 +436,7 @@ app.get('/api/species', auth, async (req,res)=>{
   res.json({ species: rows });
 });
 
-/* -------------------- WS (optional, movement not used) -------------------- */
+/* -------------------- WS (optional) -------------------- */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 wss.on('connection', (ws)=>{ ws.isAlive = true; ws.on('pong', ()=>ws.isAlive = true); });
