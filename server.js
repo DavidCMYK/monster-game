@@ -1,4 +1,4 @@
-// server.js — Fast boot + client-authoritative /api/sync + Capture endpoint
+// server.js — Fast boot + client-authoritative /api/sync + robust encounters + capture
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -31,11 +31,9 @@ const pool = new Pool({
   idleTimeoutMillis: 30000
 });
 
-/* -------------------- CONSTS -------------------- */
 const CHUNK_W = 256;
 const CHUNK_H = 256;
 
-/* -------------------- BOOT READINESS -------------------- */
 let DB_READY = false;
 let DB_ERROR = null;
 function ensureReady(req,res,next){
@@ -140,7 +138,7 @@ async function initDB() {
   }
 })();
 
-/* -------------------- BASIC QUERIES -------------------- */
+/* -------------------- helpers -------------------- */
 async function getPlayerByEmail(email){
   const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]);
   return rows[0] || null;
@@ -156,17 +154,20 @@ async function createPlayer(email, handle, password){
     [email, handle, hash]
   );
   const player_id = rows[0].id;
-  await pool.query(
-    `INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,$2,$3)`,
-    [player_id, 128, 128]
-  );
+  await pool.query(`INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,128,128)`, [player_id]);
+  await seedStarterMonster(player_id);
+  return player_id;
+}
+async function seedStarterMonster(owner_id){
+  const moves = JSON.stringify([{ name:'Strike', power:8, accuracy:0.95, pp:25, base:'physical', stack:['dmg_phys'] }]);
   await pool.query(`
     INSERT INTO mg_monsters (owner_id, species_id, level, xp, hp, max_hp, ability, moves)
-    VALUES ($1, 1, 3, 0, 28, 28, 'rescue:blink', '[
-      {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]}
-    ]'::jsonb)
-  `, [player_id]);
-  return player_id;
+    VALUES ($1, 1, 3, 0, 28, 28, 'rescue:blink', $2)
+  `, [owner_id, moves]);
+}
+async function ensureHasParty(owner_id){
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
+  if ((rows[0]?.c || 0) === 0) await seedStarterMonster(owner_id);
 }
 async function createSession(player_id){
   const t = token();
@@ -201,7 +202,7 @@ async function getParty(player_id){
   return rows;
 }
 
-/* -------------------- ENCOUNTERS / CHUNK -------------------- */
+/* -------------------- ENCOUNTERS -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
   const chunk = world.generateChunk(cx, cy);
@@ -223,8 +224,13 @@ async function buildEncounterTableForChunk(cx, cy){
     const score = (s.base_spawn_rate || 0.05) * (0.25 + 0.75*fit);
     return { speciesId: s.id, name: s.name, baseSpawnRate: s.base_spawn_rate, biomes: s.biomes, score };
   }).sort((a,b)=>b.score-a.score);
+
   const pick = scored.slice(0, 12);
-  const sum = pick.reduce((a,x)=>a+x.baseSpawnRate, 0) || 1;
+  const sum = pick.reduce((a,x)=>a+x.baseSpawnRate, 0);
+  if (pick.length === 0 || !isFinite(sum) || sum <= 0){
+    // Fallback: make sure table is never empty
+    return [{ speciesId: 1, name: 'Fieldling', baseSpawnRate: 1.0, biomes: ['grassland'] }];
+  }
   return pick.slice(0,10).map(x => ({
     speciesId: x.speciesId,
     name: x.name,
@@ -264,6 +270,7 @@ app.post('/api/login', ensureReady, async (req,res)=>{
     if (!ok) return res.status(401).json({ error:'Invalid credentials' });
     const tok = await createSession(p.id);
     const st = await getState(p.id);
+    await ensureHasParty(p.id); // make sure legacy users have a starter
     const party = await getParty(p.id);
     return res.json({ token: tok, player: { handle: p.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
   } catch(e){ console.error('login error', e); return res.status(500).json({ error:'server_error' }); }
@@ -290,7 +297,7 @@ app.get('/api/chunk', ensureReady, auth, async (req,res)=>{
   res.json({ x, y, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- MOVE (kept for compatibility) -------------------- */
+/* -------------------- MOVE -------------------- */
 app.post('/api/move', ensureReady, auth, async (req,res)=>{
   const dx = Math.max(-1, Math.min(1, (req.body?.dx) || 0));
   const dy = Math.max(-1, Math.min(1, (req.body?.dy) || 0));
@@ -364,24 +371,29 @@ function levelUp(mon){
 
 app.post('/api/battle/start', ensureReady, auth, async (req,res)=>{
   const st = await getState(req.session.player_id);
+  await ensureHasParty(req.session.player_id);                   // guarantee a starter exists
+  const party = await getParty(req.session.player_id);
+  if (!party.length) return res.status(400).json({ error:'no_party_after_seed' });
+
   const table = await buildEncounterTableForChunk(st.cx, st.cy);
+  // Safe pick even if table is somehow empty
+  let chosen = table[0] || { speciesId: 1, name:'Fieldling', baseSpawnRate:1.0, biomes:['grassland'] };
+  if (table.length > 1){
+    let total = 0; for (const e of table) total += (e.baseSpawnRate || 0);
+    if (!isFinite(total) || total <= 0) total = 1;
+    let r = Math.random() * total;
+    for (const e of table){ r -= (e.baseSpawnRate || 0); if (r <= 0){ chosen = e; break; } }
+  }
 
-  let total=0; const bag=[];
-  for (const e of table){ total += e.baseSpawnRate; bag.push([e, e.baseSpawnRate]); }
-  let r = rnd()*total, chosen = bag[0][0];
-  for (const [e,w] of bag){ r -= w; if (r<=0){ chosen=e; break; } }
-
-  const enemy = { speciesId: chosen.speciesId, level: 1 + Math.floor(rnd()*5) };
+  const enemy = { speciesId: chosen.speciesId, level: 1 + Math.floor(Math.random()*5) };
   enemy.max_hp = 16 + enemy.level*4;
   enemy.hp = enemy.max_hp;
 
-  const party = await getParty(req.session.player_id);
-  if (!party.length) return res.status(400).json({ error:'no_party' });
   const you = { ...party[0] };
-
   const battle = { player_id: req.session.player_id, you, enemy, log: [], finished: false };
   battles.set(req.session.token, battle);
-  res.json({ you, enemy, log: battle.log });
+  // include a tiny debug breadcrumb so we can verify server side is OK
+  res.json({ you, enemy, log: battle.log, _dbg: { tableLen: table.length, chosen: chosen.speciesId } });
 });
 
 app.post('/api/battle/turn', ensureReady, auth, async (req,res)=>{
@@ -439,7 +451,7 @@ app.post('/api/battle/turn', ensureReady, auth, async (req,res)=>{
   return res.status(400).json({ error:'bad_action' });
 });
 
-/* NEW: Capture endpoint */
+/* Capture */
 app.post('/api/battle/capture', ensureReady, auth, async (req,res)=>{
   const b = battles.get(req.session.token);
   if (!b) return res.status(400).json({ error:'no_battle' });
@@ -447,14 +459,12 @@ app.post('/api/battle/capture', ensureReady, auth, async (req,res)=>{
   const you = b.you;
   const enemy = b.enemy;
 
-  // simple capture odds: better when enemy HP is low
   const hpRatio = enemy.hp / Math.max(1, enemy.max_hp);
-  const base = 0.25;                     // base 25%
-  const bonus = (1 - hpRatio) * 0.6;     // up to +60%
-  const odds = Math.min(0.9, base + bonus); // cap at 90%
+  const base = 0.25;
+  const bonus = (1 - hpRatio) * 0.6;
+  const odds = Math.min(0.9, base + bonus);
 
   if (Math.random() < odds){
-    // create a new monster for the player
     const owner_id = req.session.player_id;
     const nickname = null;
     const level = Math.max(1, enemy.level|0);
