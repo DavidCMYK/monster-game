@@ -1,5 +1,5 @@
-// server.js — sessions, chunking, encounters, absolute sync,
-// battles with PP + capture, faint protection, /api/heal, and starter move backfill
+// server.js — sessions, world, encounters, absolute sync
+// Battles: PP, capture-after-KO with fixed odds, party switch, auto-sub on KO, heal
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -17,16 +17,13 @@ app.use(bodyParser.json());
 /* ---------- ENV ---------- */
 const {
   PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGPORT = 5432, PGSSLMODE = 'require',
-  PORT = 3001,
-  SKIP_NORMALIZE_ON_BOOT = 'false'
+  PORT = 3001, SKIP_NORMALIZE_ON_BOOT = 'false'
 } = process.env;
 
 const pool = new Pool({
   host: PGHOST, database: PGDATABASE, user: PGUSER, password: PGPASSWORD,
-  port: Number(PGPORT),
-  ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 4000,
-  idleTimeoutMillis: 30000
+  port: Number(PGPORT), ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 4000, idleTimeoutMillis: 30000
 });
 
 const CHUNK_W = 256, CHUNK_H = 256;
@@ -49,9 +46,7 @@ async function normalizePlayerPositions() {
      FROM norm n
     WHERE s.player_id=n.player_id;
   `);
-  console.log('✓ Normalized out-of-range tiles');
 }
-
 async function initDB(){
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_players (
@@ -102,7 +97,6 @@ async function initDB(){
       moves JSONB DEFAULT '[]'::jsonb
     );
   `);
-
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0){
     await pool.query(`
@@ -112,22 +106,20 @@ async function initDB(){
         (4,'Cliffpup', 0.08,ARRAY['mountain','grassland'],ARRAY['fauna','earth']);
     `);
   }
-
   await normalizePlayerPositions();
 }
 initDB().then(()=>console.log('✓ DB ready')).catch(e=>{ console.error('DB init failed',e); process.exit(1); });
 
 /* ---------- helpers ---------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-
 async function getPlayerByEmail(email){ const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]); return rows[0]||null; }
 async function getPlayerByHandle(handle){ const { rows } = await pool.query(`SELECT * FROM mg_players WHERE handle=$1 LIMIT 1`, [handle]); return rows[0]||null; }
+
 async function createPlayer(email, handle, password){
   const hash = await bcrypt.hash(password, 10);
   const { rows } = await pool.query(`INSERT INTO mg_players (email,handle,password_hash) VALUES ($1,$2,$3) RETURNING id`, [email,handle,hash]);
   const player_id = rows[0].id;
   await pool.query(`INSERT INTO mg_player_state (player_id,cx,cy,tx,ty) VALUES ($1,0,0,$2,$3)`, [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]);
-  // seed starter with two moves (Strike + Guard)
   await pool.query(`
     INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
     VALUES ($1,1,3,0,28,28,'rescue:blink','[
@@ -166,13 +158,11 @@ async function ensureHasParty(owner_id){
     `, [owner_id]);
   }
 }
-// Backfill a second move for old accounts
 async function ensureStarterMoves(owner_id){
   const { rows } = await pool.query(`SELECT id,moves FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 1`, [owner_id]);
   if (!rows.length) return;
   const id = rows[0].id;
   let moves = rows[0].moves || [];
-  const hasStrike = moves.some(m => (m.name||'').toLowerCase() === 'strike');
   const hasGuard  = moves.some(m => (m.name||'').toLowerCase() === 'guard');
   if (!hasGuard){
     moves = moves.slice(0,3).concat([{ name:'Guard', base:'status', power:0, accuracy:1.0, pp:15, stack:['buff_def'] }]);
@@ -322,8 +312,12 @@ app.post('/api/sync', auth, async (req,res)=>{
   res.json({ seq, player:{ handle:req.session.handle,cx,cy,tx,ty, party: await getParty(req.session.player_id) }, chunk:{...chunk,encounterTable} });
 });
 
-/* ---------- battles (PP + capture + faint handling) ---------- */
+/* ---------- battles ---------- */
 const battles = new Map();
+// DESIGN: fixed capture odds by species (fallback to DEFAULT)
+const CAPTURE_ODDS = { 1: 0.6, 2: 0.55, 4: 0.5 };
+const DEFAULT_CAPTURE_ODDS = 0.5;
+
 function rnd(){ return Math.random(); }
 function clamp(n,min,max){ return n<min?min:(n>max?max:n); }
 function calcDamage(attacker, move, defender){
@@ -338,24 +332,21 @@ function levelUp(mon){
   if (mon.xp >= need){ mon.xp -= need; mon.level += 1; mon.max_hp += 4; mon.hp = mon.max_hp; return true; }
   return false;
 }
-function ppFromMoves(moves){
-  const m = {}; (moves||[]).forEach(v => { const pp = Number(v.pp)||20; m[String(v.name||'Unknown')] = pp; });
-  return m;
-}
+function ppFromMoves(moves){ const m = {}; (moves||[]).forEach(v => { const pp = Number(v.pp)||20; m[String(v.name||'Unknown')] = pp; }); return m; }
+function firstAliveIndex(list){ for (let i=0;i<list.length;i++) if ((list[i].hp|0)>0) return i; return -1; }
 
 app.post('/api/battle/start', auth, async (req,res)=>{
   await ensureHasParty(req.session.player_id);
   await ensureStarterMoves(req.session.player_id);
+
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   if (!party.length) return res.status(400).json({ error:'no_party' });
 
-  const you = { ...party[0] };
-  you.moves = Array.isArray(you.moves) ? you.moves : [];
-  if (you.hp <= 0){
-    return res.status(409).json({ error:'fainted', need_heal:true });
-  }
+  const youIndex = firstAliveIndex(party);
+  if (youIndex < 0) return res.status(409).json({ error:'fainted', need_heal:true });
 
+  // Choose encounter species for this chunk
   const table = await buildEncounterTableForChunk(st.cx, st.cy);
   let chosen = table[0] || { speciesId:1, name:'Fieldling', baseSpawnRate:1.0 };
   if (table.length>1){
@@ -363,22 +354,63 @@ app.post('/api/battle/start', auth, async (req,res)=>{
     let r = Math.random()* (total||1);
     for (const e of table){ r -= (e.baseSpawnRate||0); if (r<=0){ chosen=e; break; } }
   }
-
   const enemy = { speciesId: chosen.speciesId, level: 1 + Math.floor(Math.random()*5) };
   enemy.max_hp = 16 + enemy.level*4; enemy.hp = enemy.max_hp;
 
-  const battle = { player_id: req.session.player_id, you, enemy, log: [], finished:false, pp: ppFromMoves(you.moves) };
+  const you = { ...party[youIndex] };
+  you.moves = Array.isArray(you.moves) ? you.moves : [];
+
+  const battle = {
+    player_id: req.session.player_id,
+    party, youIndex, you, enemy,
+    log: [],
+    finished: false,
+    allowCapture: false,   // only true AFTER enemy is KO'd
+    pp: ppFromMoves(you.moves)
+  };
   battles.set(req.session.token, battle);
-  res.json({ you, enemy, log: battle.log, pp: battle.pp, _dbg: { tableLen: table.length } });
+  res.json({ you, enemy, log: battle.log, pp: battle.pp, youIndex, partyCount: party.length });
 });
 
 app.post('/api/battle/turn', auth, async (req,res)=>{
   const b = battles.get(req.session.token);
   if (!b) return res.status(400).json({ error:'no_battle' });
-  if (b.finished) return res.json({ you:b.you, enemy:b.enemy, log:b.log, pp:b.pp, result:'finished' });
+  if (b.finished && !b.allowCapture) return res.json({ result:'finished', you:b.you, enemy:b.enemy, log:b.log, pp:b.pp, youIndex:b.youIndex });
 
   const you = b.you, enemy = b.enemy;
-  const action = req.body?.action;
+  const action = String(req.body?.action || '');
+
+  // switch consumes your turn; enemy will act after
+  if (action === 'switch'){
+    const idx = Number(req.body?.index);
+    if (!Number.isInteger(idx) || idx<0 || idx>=b.party.length) return res.status(400).json({ error:'bad_switch' });
+    const cand = b.party[idx];
+    if ((cand.hp|0) <= 0) return res.status(409).json({ error:'fainted_member' });
+    b.youIndex = idx; b.you = { ...cand }; b.pp = ppFromMoves(b.you.moves||[]);
+    b.log.push(`You switched to party #${idx+1}.`);
+    // enemy counter
+    const em = { name:'Bite', power:7, accuracy:0.9 };
+    if (Math.random() < em.accuracy){
+      const dmg2 = calcDamage(enemy, em, b.you);
+      b.you.hp = clamp(b.you.hp - dmg2, 0, b.you.max_hp);
+      b.log.push(`Enemy used ${em.name}. Your active took ${dmg2}.`);
+      await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [b.you.hp, b.you.id, req.session.player_id]);
+      // update in party mirror
+      b.party[b.youIndex].hp = b.you.hp;
+      if (b.you.hp <= 0){
+        // try auto-substitute
+        const nxt = firstAliveIndex(b.party);
+        if (nxt >= 0){
+          b.youIndex = nxt; b.you = { ...b.party[nxt] }; b.pp = ppFromMoves(b.you.moves||[]);
+          b.log.push(`Auto-switched to party #${nxt+1}.`);
+        } else {
+          battles.delete(req.session.token);
+          return res.json({ result:'you_team_wiped', you:b.you, enemy, log:b.log, pp:b.pp });
+        }
+      }
+    } else { b.log.push('Enemy missed.'); }
+    return res.json({ you:b.you, enemy, log:b.log, pp:b.pp, youIndex:b.youIndex });
+  }
 
   if (action === 'run'){
     if (Math.random() < 0.8){ battles.delete(req.session.token); return res.json({ result:'escaped', you, enemy, log:['You fled.'], pp:b.pp }); }
@@ -392,10 +424,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
             || { name:'Strike', power:8, accuracy:0.95, pp:25, base:'physical' };
 
     const left = b.pp[mv.name] ?? (mv.pp || 20);
-    if (left <= 0){
-      b.log.push(`${mv.name} has no PP left!`);
-      return res.json({ you, enemy, log:b.log, pp:b.pp });
-    }
+    if (left <= 0){ b.log.push(`${mv.name} has no PP left!`); return res.json({ you, enemy, log:b.log, pp:b.pp }); }
     b.pp[mv.name] = left - 1;
 
     if (Math.random() < (mv.accuracy ?? 0.95)){
@@ -406,47 +435,61 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       b.log.push(`Your ${mv.name} missed.`);
     }
 
+    // enemy KO → stop combat turns, open capture window
     if (enemy.hp <= 0){
       you.xp += enemy.level * 10;
       const leveled = levelUp(you);
       await pool.query(`UPDATE mg_monsters SET level=$1,xp=$2,hp=$3,max_hp=$4 WHERE id=$5 AND owner_id=$6`,
         [you.level,you.xp,you.hp,you.max_hp,you.id,req.session.player_id]);
       b.finished = true;
-      return res.json({ result:'enemy_down', you, enemy, log:b.log, pp:b.pp });
+      b.allowCapture = true; // SPEC: capture option appears now, single roll
+      return res.json({ result:'enemy_down', allowCapture:true, you, enemy, log:b.log, pp:b.pp, youIndex:b.youIndex });
     }
 
-    // enemy turn
+    // enemy counter if still alive
     const em = { name:'Bite', power:7, accuracy:0.9 };
     if (Math.random() < em.accuracy){
       const dmg2 = calcDamage(enemy, em, you);
       you.hp = clamp(you.hp - dmg2, 0, you.max_hp);
       b.log.push(`Enemy used ${em.name}. You took ${dmg2}.`);
       await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [you.hp, you.id, req.session.player_id]);
+      // mirror into party
+      b.party[b.youIndex].hp = you.hp;
+
       if (you.hp <= 0){
-        b.finished = true;
-        battles.delete(req.session.token);
-        return res.json({ result:'you_down', you, enemy, log:b.log, pp:b.pp });
+        // auto-substitute if possible
+        const nxt = firstAliveIndex(b.party);
+        if (nxt >= 0){
+          b.log.push('Your active fainted!');
+          b.youIndex = nxt; b.you = { ...b.party[nxt] }; b.pp = ppFromMoves(b.you.moves||[]);
+          b.log.push(`Auto-switched to party #${nxt+1}.`);
+          return res.json({ result:'you_swap', you:b.you, enemy, log:b.log, pp:b.pp, youIndex:b.youIndex });
+        } else {
+          battles.delete(req.session.token);
+          return res.json({ result:'you_team_wiped', you, enemy, log:b.log, pp:b.pp });
+        }
       }
     } else {
       b.log.push('Enemy missed.');
     }
 
-    return res.json({ you, enemy, log:b.log, pp:b.pp });
+    return res.json({ you, enemy, log:b.log, pp:b.pp, youIndex:b.youIndex });
   }
 
   return res.status(400).json({ error:'bad_action' });
 });
 
+// SPEC: capture only allowed AFTER enemy KO, single roll with fixed odds
 app.post('/api/battle/capture', auth, async (req,res)=>{
   const b = battles.get(req.session.token);
   if (!b) return res.status(400).json({ error:'no_battle' });
-  const you = b.you, enemy = b.enemy;
+  if (!b.allowCapture) return res.status(409).json({ error:'not_allowed' });
 
-  const hpRatio = enemy.hp / Math.max(1, enemy.max_hp);
-  const base = 0.25, bonus = (1 - hpRatio) * 0.6;
-  const odds = Math.min(0.9, base + bonus);
+  const enemy = b.enemy;
+  const odds = CAPTURE_ODDS[enemy.speciesId] ?? DEFAULT_CAPTURE_ODDS;
 
-  if (Math.random() < odds){
+  const success = Math.random() < odds;
+  if (success){
     const owner_id = req.session.player_id;
     const level = Math.max(1, enemy.level|0);
     const max_hp = 16 + level*4;
@@ -454,14 +497,14 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     const moves = JSON.stringify([{ name:'Strike', power:8, accuracy:0.95, pp:25, base:'physical', stack:['dmg_phys'] }]);
     await pool.query(`INSERT INTO mg_monsters (owner_id,species_id,nickname,level,xp,hp,max_hp,ability,moves)
                       VALUES ($1,$2,$3,$4,0,$5,$6,$7,$8)`,
-                      [owner_id, enemy.speciesId, null, level, hp, max_hp, 'rescue:blink', moves]);
+      [owner_id, enemy.speciesId, null, level, hp, max_hp, 'rescue:blink', moves]);
     b.log.push('Captured!');
-    b.finished = true;
     battles.delete(req.session.token);
-    return res.json({ result:'captured', you, enemy, log:b.log });
+    return res.json({ result:'captured', log:b.log });
   } else {
-    b.log.push('It broke free!');
-    return res.json({ result:'escaped_ball', you, enemy, log:b.log });
+    b.log.push('Capture failed.');
+    battles.delete(req.session.token);
+    return res.json({ result:'capture_failed', log:b.log });
   }
 });
 
