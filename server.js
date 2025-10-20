@@ -1,4 +1,4 @@
-// server.js — Monster Game backend (Postgres) — 256×256 chunks + seq-aware sync + chunk caching
+// server.js — Monster Game backend (Postgres) — 256×256 chunks + read-only sync + chunk caching
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -6,7 +6,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
-const world = require('./world'); // must export generateChunk(cx, cy) -> { w:256,h:256,tiles:[[]] }
+const world = require('./world');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -33,15 +33,15 @@ const CHUNK_W = 256;
 const CHUNK_H = 256;
 
 /* -------------------- IN-MEM STATE -------------------- */
-// Per-session sync guard: last processed sequence + last accepted position
+// Last processed sequence per token (for diagnostics) + last accepted position
 const SYNC_STATE = new Map(); // token -> { lastSeq: number, lastPos: { cx, cy, tx, ty } }
 
-// LRU caches for chunk tiles and encounter tables
+// LRU caches
 const CHUNK_CACHE_MAX = 128;
 const CHUNK_CACHE = new Map();     // key: `${cx},${cy}` -> { w,h,tiles }
 const ENCOUNTER_CACHE = new Map(); // key: `${cx},${cy}` -> encounterTable
 
-/* -------------------- CACHE HELPERS -------------------- */
+/* -------------------- HELPERS -------------------- */
 function lruGet(map, key){ const v = map.get(key); if (v){ map.delete(key); map.set(key, v); } return v; }
 function lruSet(map, key, val, max){
   if (map.has(key)) map.delete(key);
@@ -52,15 +52,11 @@ function getChunkCached(cx, cy){
   const k = `${cx},${cy}`;
   const hit = lruGet(CHUNK_CACHE, k);
   if (hit) return hit;
-  const gen = world.generateChunk(cx, cy); // deterministic
+  const gen = world.generateChunk(cx, cy);
   lruSet(CHUNK_CACHE, k, gen, CHUNK_CACHE_MAX);
   return gen;
 }
-
-/* -------------------- UTILS -------------------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-function toWorldXY(cx, cy, tx, ty){ return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty }; }
-function manhattan(wx1, wy1, wx2, wy2){ return Math.abs(wx1 - wx2) + Math.abs(wy1 - wy2); }
 
 /* -------------------- DB INIT + NORMALIZE -------------------- */
 async function normalizePlayerPositions() {
@@ -208,7 +204,7 @@ async function getParty(player_id){
   return rows;
 }
 
-/* -------------------- ENCOUNTER TABLE (uses cached chunk) -------------------- */
+/* -------------------- ENCOUNTER TABLE (cached) -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
   const chunk = getChunkCached(cx, cy);
@@ -268,7 +264,6 @@ app.post('/api/register', async (req,res)=>{
     const st = await getState(player_id);
     const party = await getParty(player_id);
 
-    // Initialize sync state for this session token
     SYNC_STATE.set(tok, { lastSeq: 0, lastPos: { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty } });
 
     return res.json({ token: tok, player: { handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
@@ -286,7 +281,6 @@ app.post('/api/login', async (req,res)=>{
     const st = await getState(p.id);
     const party = await getParty(p.id);
 
-    // Initialize sync state for this session token
     SYNC_STATE.set(tok, { lastSeq: 0, lastPos: { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty } });
 
     return res.json({ token: tok, player: { handle: p.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party } });
@@ -329,7 +323,6 @@ app.post('/api/move', auth, async (req,res)=>{
 
   await setState(req.session.player_id, cx, cy, tx, ty);
 
-  // Update in-memory lastPos for this token
   const tokenStr = req.session.token;
   const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
   rec.lastPos = { cx, cy, tx, ty };
@@ -340,63 +333,25 @@ app.post('/api/move', auth, async (req,res)=>{
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- ABSOLUTE SYNC (sequence-aware) -------------------- */
+/* -------------------- SYNC (read-only / authoritative) -------------------- */
+// Ignores client-sent coords; just returns server state (prevents oscillation).
 app.post('/api/sync', auth, async (req,res)=>{
-  let { cx, cy, tx, ty, seq } = req.body || {};
-  cx = Number(cx); cy = Number(cy); tx = Number(tx); ty = Number(ty); seq = Number(seq) || 0;
-  if (!Number.isInteger(cx)||!Number.isInteger(cy)||!Number.isInteger(tx)||!Number.isInteger(ty)){
-    return res.status(400).json({ error:'bad_coords' });
-  }
-
-  // Normalize 0..255 and carry chunk coords
-  while (tx < 0){ tx += CHUNK_W; cx -= 1; }
-  while (ty < 0){ ty += CHUNK_H; cy -= 1; }
-  while (tx >= CHUNK_W){ tx -= CHUNK_W; cx += 1; }
-  while (ty >= CHUNK_H){ ty -= CHUNK_H; cy += 1; }
-
+  const seq = Number(req.body?.seq) || 0;
   const tokenStr = req.headers.authorization || req.query.token;
   const rec = SYNC_STATE.get(tokenStr) || { lastSeq: 0, lastPos: null };
 
-  // Drop stale or duplicate packets outright
-  if (seq <= rec.lastSeq){
-    const st = rec.lastPos || await getState(req.session.player_id);
-    const chunkStale = getChunkCached(st.cx, st.cy);
-    const encounterTableStale = await getEncounterTableCached(st.cx, st.cy);
-    return res.json({
-      seq: rec.lastSeq,
-      player: { handle: req.session.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party: await getParty(req.session.player_id) },
-      chunk: { ...chunkStale, encounterTable: encounterTableStale }
-    });
+  // record last seen seq (for diagnostics only)
+  if (seq > rec.lastSeq) {
+    rec.lastSeq = seq;
+    SYNC_STATE.set(tokenStr, rec);
   }
 
-  // Compare against newest known position (prefer in-memory)
-  let base = rec.lastPos;
-  if (!base){
-    const st = await getState(req.session.player_id);
-    base = { cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty };
-  }
-
-  // Soft anti-teleport: allowance grows with seq gap, capped
-  const from = toWorldXY(base.cx, base.cy, base.tx, base.ty);
-  const to   = toWorldXY(cx, cy, tx, ty);
-  const seqDelta = Math.max(1, seq - rec.lastSeq);
-  const maxDist = Math.min(64, 4 + 4*seqDelta);
-
-  let next = { cx, cy, tx, ty };
-  if (manhattan(from.wx, from.wy, to.wx, to.wy) > maxDist){
-    next = base; // reject big jump
-  } else {
-    await setState(req.session.player_id, cx, cy, tx, ty);
-  }
-
-  // Update in-memory seq + pos
-  SYNC_STATE.set(tokenStr, { lastSeq: seq, lastPos: next });
-
-  const chunk = getChunkCached(next.cx, next.cy);
-  const encounterTable = await getEncounterTableCached(next.cx, next.cy);
+  const st = await getState(req.session.player_id);
+  const chunk = getChunkCached(st.cx, st.cy);
+  const encounterTable = await getEncounterTableCached(st.cx, st.cy);
   res.json({
-    seq,
-    player: { handle: req.session.handle, cx: next.cx, cy: next.cy, tx: next.tx, ty: next.ty, party: await getParty(req.session.player_id) },
+    seq: rec.lastSeq,
+    player: { handle: req.session.handle, cx: st.cx, cy: st.cy, tx: st.tx, ty: st.ty, party: await getParty(req.session.player_id) },
     chunk: { ...chunk, encounterTable }
   });
 });
