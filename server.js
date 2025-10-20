@@ -1,4 +1,4 @@
-// server.js — Postgres, server-side encounters + battles + capture + party (256×256 chunks per spec)
+// server.js — Monster Game backend (Postgres) — SPEC: 256×256 chunks
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -6,13 +6,14 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
-const world = require('./world');
+const world = require('./world'); // must export generateChunk(cx, cy) with {w:256,h:256,tiles:...}
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.options('*', cors());
 app.use(bodyParser.json());
 
+/* -------------------- ENV -------------------- */
 const {
   PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGPORT = 5432, PGSSLMODE = 'require',
   PORT = 3001
@@ -27,7 +28,32 @@ const pool = new Pool({
   ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
 });
 
-/* ------------------------ DB INIT ------------------------ */
+/* -------------------- CONSTS -------------------- */
+const CHUNK_W = 256;
+const CHUNK_H = 256;
+
+/* -------------------- DB INIT + NORMALIZE -------------------- */
+async function normalizePlayerPositions() {
+  console.log('→ Normalizing player positions to 256×256 bounds…');
+  await pool.query(`
+    WITH norm AS (
+      SELECT
+        player_id,
+        (cx + FLOOR(tx / 256.0))::int AS new_cx,
+        (cy + FLOOR(ty / 256.0))::int AS new_cy,
+        (CASE WHEN tx >= 0 THEN (tx % 256) ELSE 256 + (tx % 256) END)::int AS new_tx,
+        (CASE WHEN ty >= 0 THEN (ty % 256) ELSE 256 + (ty % 256) END)::int AS new_ty
+      FROM mg_player_state
+      WHERE tx NOT BETWEEN 0 AND 255 OR ty NOT BETWEEN 0 AND 255
+    )
+    UPDATE mg_player_state s
+    SET cx = n.new_cx, cy = n.new_cy, tx = n.new_tx, ty = n.new_ty, updated_at = now()
+    FROM norm n
+    WHERE s.player_id = n.player_id;
+  `);
+  console.log('✓ Normalization pass complete.');
+}
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_players (
@@ -50,8 +76,8 @@ async function initDB() {
       player_id INT PRIMARY KEY REFERENCES mg_players(id) ON DELETE CASCADE,
       cx INT NOT NULL DEFAULT 0,
       cy INT NOT NULL DEFAULT 0,
-      tx INT NOT NULL DEFAULT 128,  -- center of 256 grid
-      ty INT NOT NULL DEFAULT 128,  -- center of 256 grid
+      tx INT NOT NULL DEFAULT 128,
+      ty INT NOT NULL DEFAULT 128,
       updated_at TIMESTAMPTZ DEFAULT now()
     );
   `);
@@ -78,6 +104,8 @@ async function initDB() {
       moves JSONB DEFAULT '[]'::jsonb
     );
   `);
+
+  // Seed a few species if none exist
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0) {
     await pool.query(`
@@ -87,21 +115,20 @@ async function initDB() {
         (4, 'Cliffpup',  0.08, ARRAY['mountain','grassland'],   ARRAY['fauna','earth']);
     `);
   }
+
+  // One-time/each-boot normalization to kill rubber-banding from OOB tx/ty
+  await normalizePlayerPositions();
 }
 
-/* -------------------- UTIL / AUTH -------------------- */
-// Must match world.generateChunk() and client logic
-const CHUNK_W = 256;
-const CHUNK_H = 256;
-
+/* -------------------- UTIL -------------------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
 async function getPlayerByEmail(email){
-  const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email = $1 LIMIT 1`, [email]);
+  const { rows } = await pool.query(`SELECT * FROM mg_players WHERE email=$1 LIMIT 1`, [email]);
   return rows[0] || null;
 }
 async function getPlayerByHandle(handle){
-  const { rows } = await pool.query(`SELECT * FROM mg_players WHERE handle = $1 LIMIT 1`, [handle]);
+  const { rows } = await pool.query(`SELECT * FROM mg_players WHERE handle=$1 LIMIT 1`, [handle]);
   return rows[0] || null;
 }
 async function createPlayer(email, handle, password){
@@ -115,6 +142,7 @@ async function createPlayer(email, handle, password){
     `INSERT INTO mg_player_state (player_id, cx, cy, tx, ty) VALUES ($1,0,0,$2,$3)`,
     [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]
   );
+  // Give a simple starter monster
   await pool.query(`
     INSERT INTO mg_monsters (owner_id, species_id, level, xp, hp, max_hp, ability, moves)
     VALUES ($1, 1, 3, 0, 28, 28, 'rescue:blink', '[
@@ -138,7 +166,7 @@ async function getSession(tokenStr){
 }
 async function getState(player_id){
   const { rows } = await pool.query(
-    `SELECT player_id, cx, cy, tx, ty FROM mg_player_state WHERE player_id = $1 LIMIT 1`,
+    `SELECT player_id, cx, cy, tx, ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`,
     [player_id]
   );
   return rows[0] || null;
@@ -156,13 +184,14 @@ async function getParty(player_id){
   return rows;
 }
 
-/* -------------------- HEALTH + AUTH -------------------- */
+/* -------------------- BASIC -------------------- */
 app.get('/', (req,res)=>res.type('text').send('Monster Game API online. Try /api/health'));
 app.get('/api/health', async (req,res)=>{
   try { const { rows } = await pool.query('SELECT 1 AS ok'); res.json({ ok: rows[0].ok === 1 }); }
   catch (e){ res.status(500).json({ ok:false, db_error: e.code || String(e) }); }
 });
 
+/* -------------------- AUTH -------------------- */
 app.post('/api/register', async (req,res)=>{
   try{
     const { email, password, handle } = req.body || {};
@@ -202,10 +231,10 @@ async function auth(req,res,next){
   } catch{ return res.status(500).json({ error:'server_error' }); }
 }
 
-/* -------------------- ENCOUNTERS -------------------- */
+/* -------------------- ENCOUNTERS / CHUNK -------------------- */
 async function buildEncounterTableForChunk(cx, cy){
   const { rows: sp } = await pool.query(`SELECT id, name, base_spawn_rate, biomes, types FROM mg_species ORDER BY id ASC`);
-  const chunk = world.generateChunk(cx, cy);
+  const chunk = world.generateChunk(cx, cy); // assumes w=256,h=256
   const counts = {};
   for (let y=0; y<chunk.h; y+=16){
     for (let x=0; x<chunk.w; x+=16){
@@ -244,7 +273,7 @@ app.get('/api/chunk', auth, async (req,res)=>{
   res.json({ x, y, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- MOVE (kept for compatibility) -------------------- */
+/* -------------------- MOVE (relative) -------------------- */
 app.post('/api/move', auth, async (req,res)=>{
   const dx = Math.max(-1, Math.min(1, (req.body?.dx) || 0));
   const dy = Math.max(-1, Math.min(1, (req.body?.dy) || 0));
@@ -263,7 +292,7 @@ app.post('/api/move', auth, async (req,res)=>{
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- ABSOLUTE SYNC (256×256) -------------------- */
+/* -------------------- ABSOLUTE SYNC (authoritative) -------------------- */
 function worldTiles(cx, cy, tx, ty){
   return { wx: cx*CHUNK_W + tx, wy: cy*CHUNK_H + ty };
 }
@@ -285,7 +314,7 @@ app.post('/api/sync', auth, async (req,res)=>{
   const next = worldTiles(cx, cy, tx, ty);
   const dist = Math.abs(next.wx - prev.wx) + Math.abs(next.wy - prev.wy);
 
-  // We sync every step, allow small bursts; clamp only if absurd
+  // Allow modest step bursts; clamp only if absurd
   const MAX_ALLOWED = 32; // tiles since last save
   if (dist > MAX_ALLOWED){
     cx = st.cx; cy = st.cy; tx = st.tx; ty = st.ty;
@@ -297,10 +326,15 @@ app.post('/api/sync', auth, async (req,res)=>{
   res.json({ player: { handle: req.session.handle, cx, cy, tx, ty, party: await getParty(req.session.player_id) }, chunk: { ...chunk, encounterTable } });
 });
 
-/* -------------------- PARTY -------------------- */
+/* -------------------- PARTY / SPECIES -------------------- */
 app.get('/api/party', auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
   res.json({ party });
+});
+
+app.get('/api/species', auth, async (req,res)=>{
+  const { rows } = await pool.query(`SELECT id, name, base_spawn_rate AS "baseSpawnRate", biomes, types FROM mg_species ORDER BY id ASC`);
+  res.json({ species: rows });
 });
 
 /* -------------------- BATTLE (wild) -------------------- */
@@ -430,18 +464,13 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
   }
 });
 
-/* -------------------- SPECIES LIST -------------------- */
-app.get('/api/species', auth, async (req,res)=>{
-  const { rows } = await pool.query(`SELECT id, name, base_spawn_rate AS "baseSpawnRate", biomes, types FROM mg_species ORDER BY id ASC`);
-  res.json({ species: rows });
-});
-
-/* -------------------- WS (optional) -------------------- */
+/* -------------------- WS KEEPALIVE -------------------- */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 wss.on('connection', (ws)=>{ ws.isAlive = true; ws.on('pong', ()=>ws.isAlive = true); });
 setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate(); ws.isAlive=false; ws.ping(); }); }, 30000);
 
+/* -------------------- BOOT -------------------- */
 initDB()
   .then(()=>{ server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT)); })
   .catch((e)=>{ console.error('DB init failed:', e); process.exit(1); });
