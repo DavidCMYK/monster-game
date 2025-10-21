@@ -10,6 +10,84 @@ const { Pool } = require('pg');
 const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
+// --- Stack validation helpers (effects/bonuses) ---
+function _contentIndex(){
+  const c = getContent() || {};
+  const effects = Array.isArray(c.effects) ? c.effects : [];
+  const bonuses = Array.isArray(c.bonuses) ? c.bonuses : [];
+
+  const effByCode = Object.create(null);
+  for (const e of effects){
+    const code = String(e.code || '').trim();
+    if (code) effByCode[code] = e;
+  }
+
+  const bonByCode = Object.create(null);
+  for (const b of bonuses){
+    const code = String(b.code || '').trim();
+    if (code) bonByCode[code] = b;
+  }
+
+  // Heuristic base-effect detector:
+  // 1) Prefer explicit CSV flags (any of these columns set to 1/true/yes),
+  // 2) fallback: codes that look like base actions (dmg_*, guard, heal*)
+  function isBaseEffect(e){
+    if (!e) return false;
+    const flags = ['base','base_flag','base_flag_eligible','base_eligible','is_base','baseeffect'];
+    for (const k of flags){
+      const v = String(e[k] ?? '').toLowerCase();
+      if (v === '1' || v === 'true' || v === 'yes') return true;
+    }
+    const code = String(e.code || '');
+    return /^dmg_/.test(code) || code === 'guard' || /^heal/.test(code);
+  }
+
+  return { effByCode, bonByCode, isBaseEffect };
+}
+
+function validateAndSanitizeStack(inputStack, inputBonuses){
+  const { effByCode, bonByCode, isBaseEffect } = _contentIndex();
+
+  const rawStack = Array.isArray(inputStack) ? inputStack.map(x => String(x).trim()) : [];
+  const rawBonus = Array.isArray(inputBonuses) ? inputBonuses.map(x => String(x).trim()) : [];
+
+  // Keep only codes that exist in the CSV-driven pool
+  const stack = rawStack.filter(code => !!effByCode[code]);
+  const bonuses = rawBonus.filter(code => !!bonByCode[code]);
+
+  // Enforce exactly one base effect
+  const baseCodes = stack.filter(code => isBaseEffect(effByCode[code]));
+  if (baseCodes.length === 0){
+    return { ok:false, error:'no_base_effect', message:'Your stack must include exactly one base effect (e.g., dmg_phys or dmg_spec).' };
+  }
+  const baseKeep = baseCodes[0];
+  const filtered = [];
+  let basePlaced = false;
+  for (const code of stack){
+    const isBase = isBaseEffect(effByCode[code]);
+    if (isBase){
+      if (basePlaced){
+        // skip any extra base effects
+        continue;
+      }
+      if (code !== baseKeep) continue; // only allow the first-found base
+      filtered.push(code);
+      basePlaced = true;
+    } else {
+      filtered.push(code);
+    }
+  }
+
+  // Guarantee the base is first in the stack (helps downstream resolver)
+  if (filtered[0] !== baseKeep){
+    const withoutBase = filtered.filter(c => c !== baseKeep);
+    filtered.length = 0;
+    filtered.push(baseKeep, ...withoutBase);
+  }
+
+  return { ok:true, stack: filtered, bonuses };
+}
+
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -469,23 +547,43 @@ app.post('/api/party/reorder', auth, async (req,res)=>{
 // update a specific move's stack/bonuses for one monster
 app.post('/api/monster/move', auth, async (req,res)=>{
   try{
-    const { id, index, stack, bonuses } = req.body||{};
+    const { id, index, stack, bonuses } = req.body || {};
     const monId = id|0, idx = index|0;
-    const { rows } = await pool.query(`SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
-                                      [monId, req.session.player_id]);
+
+    const { rows } = await pool.query(
+      `SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
+      [monId, req.session.player_id]
+    );
     if (!rows.length) return res.status(404).json({ error:'not_found' });
+
     const moves = Array.isArray(rows[0].moves) ? rows[0].moves : [];
     if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
 
-    const newStack = Array.isArray(stack) ? stack.map(s=>String(s)) : [];
-    const newBonuses = Array.isArray(bonuses) ? bonuses.map(s=>String(s)) : [];
+    // --- Validate & sanitize against CSV content
+    const result = validateAndSanitizeStack(stack, bonuses);
+    if (!result.ok){
+      return res.status(400).json({ error: result.error, message: result.message });
+    }
 
+    const newStack   = result.stack;
+    const newBonuses = result.bonuses;
+
+    // Merge into existing move object; do not change name/power/etc here
     moves[idx] = { ...(moves[idx]||{}), stack:newStack, bonuses:newBonuses };
-    await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`,
-                     [JSON.stringify(moves), monId, req.session.player_id]);
-    res.json({ ok:true, moves });
-  }catch(e){ res.status(500).json({ error:'server_error' }); }
+
+    await pool.query(
+      `UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`,
+      [JSON.stringify(moves), monId, req.session.player_id]
+    );
+
+    // Helpful echo for the UI
+    res.json({ ok:true, moves, sanitized:true });
+  }catch(e){
+    console.error('monster/move error:', e);
+    res.status(500).json({ error:'server_error' });
+  }
 });
+
 
 async function doHeal(owner_id){
   await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [owner_id]);
