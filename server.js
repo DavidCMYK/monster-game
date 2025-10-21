@@ -266,6 +266,17 @@ async function doHeal(owner_id){
 app.post('/api/heal', auth, async (req,res)=>{ try{ res.json(await doHeal(req.session.player_id)); }catch(e){ res.status(500).json({ error:'server_error' }); }});
 app.get('/api/heal',  auth, async (req,res)=>{ try{ res.json(await doHeal(req.session.player_id)); }catch(e){ res.status(500).json({ error:'server_error' }); }});
 
+app.post('/api/monster/nickname', auth, async (req,res)=>{
+  try{
+    const id = req.body?.id|0;
+    const nickname = String(req.body?.nickname||'').slice(0,24);
+    if (!id) return res.status(400).json({ error:'bad_id' });
+    await pool.query(`UPDATE mg_monsters SET nickname=$1 WHERE id=$2 AND owner_id=$3`, [nickname, id, req.session.player_id]);
+    const party = await getParty(req.session.player_id);
+    res.json({ ok:true, party });
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
+});
+
 /* ---------- species & chunk ---------- */
 app.get('/api/species', async (_req,res)=>{
   try{ const { rows } = await pool.query(`SELECT id,name,base_spawn_rate,biomes,types FROM mg_species ORDER BY id ASC`); res.json({ species: rows }); }
