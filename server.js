@@ -52,6 +52,17 @@ async function initDB(){
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_player_state (player_id INT PRIMARY KEY REFERENCES mg_players(id) ON DELETE CASCADE, cx INT NOT NULL DEFAULT 0, cy INT NOT NULL DEFAULT 0, tx INT NOT NULL DEFAULT 128, ty INT NOT NULL DEFAULT 128, updated_at TIMESTAMPTZ DEFAULT now());`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_species (id INT PRIMARY KEY, name TEXT NOT NULL, base_spawn_rate REAL NOT NULL DEFAULT 0.05, biomes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[], types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]);`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_monsters (id SERIAL PRIMARY KEY, owner_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, species_id INT NOT NULL REFERENCES mg_species(id), nickname TEXT, level INT NOT NULL DEFAULT 1, xp INT NOT NULL DEFAULT 0, hp INT NOT NULL DEFAULT 20, max_hp INT NOT NULL DEFAULT 20, ability TEXT, moves JSONB DEFAULT '[]'::jsonb);`);
+  await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS slot INT`);
+  await pool.query(`
+    WITH ranked AS (
+      SELECT id, owner_id, ROW_NUMBER() OVER (PARTITION BY owner_id ORDER BY slot NULLS LAST, id) AS rn
+      FROM mg_monsters
+    )
+    UPDATE mg_monsters m
+       SET slot = ranked.rn
+      FROM ranked
+     WHERE m.id = ranked.id AND m.slot IS NULL
+  `);
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS current_pp JSONB`);
 
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
@@ -78,12 +89,13 @@ async function createPlayer(email, handle, password){
   const player_id = rows[0].id;
   await pool.query(`INSERT INTO mg_player_state (player_id,cx,cy,tx,ty) VALUES ($1,0,0,$2,$3)`, [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]);
   await pool.query(`
-    INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
+    INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,slot)
     VALUES ($1,1,3,0,28,28,'rescue:blink','[
       {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]},
       {"name":"Guard","base":"status","power":0,"accuracy":1.0,"pp":15,"stack":["buff_def"]}
-    ]'::jsonb)
+    ]'::jsonb, 1)
   `,[player_id]);
+
   return player_id;
 }
 async function createSession(player_id){ const t = token(); await pool.query(`INSERT INTO mg_sessions (token,player_id) VALUES ($1,$2)`, [t,player_id]); return t; }
@@ -95,13 +107,16 @@ async function deleteSession(tok){ await pool.query(`DELETE FROM mg_sessions WHE
 async function getState(player_id){ const { rows } = await pool.query(`SELECT player_id,cx,cy,tx,ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`, [player_id]); return rows[0]||null; }
 async function setState(player_id,cx,cy,tx,ty){ await pool.query(`UPDATE mg_player_state SET cx=$1,cy=$2,tx=$3,ty=$4,updated_at=now() WHERE player_id=$5`,[cx,cy,tx,ty,player_id]); }
 async function getParty(player_id){
-  const { rows } = await pool.query(
-    `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,current_pp
-     FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 6`,
-    [player_id]
-  );
+  const { rows } = await pool.query(`
+    SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,slot
+    FROM   mg_monsters
+    WHERE  owner_id=$1
+    ORDER BY slot ASC, id ASC
+    LIMIT 6
+  `, [player_id]);
   return rows;
 }
+
 
 async function ensureHasParty(owner_id){
   const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
@@ -218,6 +233,29 @@ app.get('/api/party', auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
   res.json({ party });
 });
+app.post('/api/party/reorder', auth, async (req,res)=>{
+  try{
+    const party = await getParty(req.session.player_id);
+    const from = Math.max(0, Math.min((req.body.from|0), party.length-1));
+    const to   = Math.max(0, Math.min((req.body.to|0),   party.length-1));
+    if (from === to) return res.json({ ok:true, party });
+
+    const a = party[from], b = party[to];
+    if (!a || !b) return res.status(400).json({ error:'bad_index' });
+
+    await pool.query('BEGIN');
+    await pool.query(`UPDATE mg_monsters SET slot=$1 WHERE id=$2 AND owner_id=$3`, [b.slot|0, a.id, req.session.player_id]);
+    await pool.query(`UPDATE mg_monsters SET slot=$1 WHERE id=$2 AND owner_id=$3`, [a.slot|0, b.id, req.session.player_id]);
+    await pool.query('COMMIT');
+
+    const updated = await getParty(req.session.player_id);
+    res.json({ ok:true, party: updated });
+  }catch(e){
+    try{ await pool.query('ROLLBACK'); }catch(_){}
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
 async function doHeal(owner_id){
   await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [owner_id]);
   await pool.query(`UPDATE mg_monsters SET current_pp = NULL WHERE owner_id=$1`, [owner_id]);
