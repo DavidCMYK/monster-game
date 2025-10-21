@@ -326,6 +326,20 @@ async function buildEnemyFromTile(tile){
 
 app.post('/api/battle/start', auth, async (req,res)=>{
   try{
+    // If a battle already exists for this session, return it instead of creating a new one.
+    const existing = battles.get(req.session.token);
+    if (existing){
+      return res.json({
+        you: existing.you,
+        enemy: existing.enemy,
+        youIndex: existing.youIndex|0,
+        pp: existing.pp || {},
+        log: existing.log || [],
+        allowCapture: !!existing.allowCapture,
+        requireSwitch: !!existing.requireSwitch
+      });
+    }
+
     const party = await getParty(req.session.player_id);
     const idx = firstAliveIndex(party);
     if (idx<0) return res.status(409).json({ error:'you_fainted' });
@@ -337,13 +351,21 @@ app.post('/api/battle/start', auth, async (req,res)=>{
     const you = { ...party[idx] };
     const pp = await getCurrentPP(you);
 
-
-    const battle = { you, enemy, youIndex: idx, pp, log:[`A wild ${enemy.name} appears!`], allowCapture:false, owner_id:req.session.player_id, requireSwitch:false };
+    const battle = {
+      you, enemy, youIndex: idx, pp,
+      log:[`A wild ${enemy.name} appears!`],
+      allowCapture:false, owner_id:req.session.player_id,
+      requireSwitch:false
+    };
     battles.set(req.session.token, battle);
 
-    res.json({ you, enemy, youIndex: idx, pp, log: battle.log, allowCapture: false });
+    res.json({
+      you, enemy, youIndex: idx, pp,
+      log: battle.log, allowCapture: false, requireSwitch:false
+    });
   }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
+
 
 app.post('/api/battle/turn', auth, async (req,res)=>{
   try{
