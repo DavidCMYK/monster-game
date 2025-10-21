@@ -155,6 +155,11 @@ async function monName(mon){
   return await speciesNameById(mon.species_id);
 }
 
+const EFFECT_POOL = {
+  effects: ['dmg_phys','dmg_spec','buff_atk','buff_def','debuff_atk','debuff_def','heal_small','stun','dot_poison'],
+  bonuses: ['high_crit','pierce_armor','life_steal','multi_hit','priority','accuracy_up']
+};
+
 function buildPPFromMoves(mon){
   const map={}; (Array.isArray(mon.moves)?mon.moves:[]).slice(0,4).forEach(m=>{
     const n=m?.name; if (!n) return; map[n]=(m.pp|0)||20;
@@ -257,6 +262,32 @@ app.post('/api/party/reorder', auth, async (req,res)=>{
     try{ await pool.query('ROLLBACK'); }catch(_){}
     res.status(500).json({ error:'server_error' });
   }
+});
+
+// pool of effects/bonuses for editing moves (can be made species/ability dependent later)
+app.get('/api/move-pool', auth, async (req,res)=>{
+  res.json(EFFECT_POOL);
+});
+
+// update a specific move's stack/bonuses for one monster
+app.post('/api/monster/move', auth, async (req,res)=>{
+  try{
+    const { id, index, stack, bonuses } = req.body||{};
+    const monId = id|0, idx = index|0;
+    const { rows } = await pool.query(`SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
+                                      [monId, req.session.player_id]);
+    if (!rows.length) return res.status(404).json({ error:'not_found' });
+    const moves = Array.isArray(rows[0].moves) ? rows[0].moves : [];
+    if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
+
+    const newStack = Array.isArray(stack) ? stack.map(s=>String(s)) : [];
+    const newBonuses = Array.isArray(bonuses) ? bonuses.map(s=>String(s)) : [];
+
+    moves[idx] = { ...(moves[idx]||{}), stack:newStack, bonuses:newBonuses };
+    await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`,
+                     [JSON.stringify(moves), monId, req.session.player_id]);
+    res.json({ ok:true, moves });
+  }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 
 async function doHeal(owner_id){
