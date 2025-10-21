@@ -385,6 +385,38 @@ function calcDamage(move, atkLevel){
   const base = Math.max(1, Math.round(power + atkLevel*0.5));
   return base;
 }
+
+function xpNeeded(level){ return 20 + (level|0)*(level|0)*10; } // quadratic-ish curve
+
+async function awardXP(ownerId, mon, enemyLevel){
+  const gain = Math.max(5, Math.round(10 + (enemyLevel|0)*4));
+  let xp = (mon.xp|0) + gain;
+  let level = mon.level|0;
+  let hp = mon.hp|0;
+  let max_hp = mon.max_hp|0;
+  const msgs = [];
+
+  while (xp >= xpNeeded(level)){
+    xp -= xpNeeded(level);
+    level += 1;
+    max_hp += 4;                 // simple stat growth
+    hp = Math.min(max_hp, hp+4); // small heal on level-up
+    const nm = await monName(mon);
+    msgs.push(`${nm} grew to Lv${level}!`);
+  }
+
+  await pool.query(
+    `UPDATE mg_monsters SET xp=$1, level=$2, hp=$3, max_hp=$4 WHERE id=$5 AND owner_id=$6`,
+    [xp, level, hp, max_hp, mon.id, ownerId]
+  );
+  const { rows } = await pool.query(
+    `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves FROM mg_monsters WHERE id=$1 AND owner_id=$2`,
+    [mon.id, ownerId]
+  );
+  return { updated: rows[0], gain, msgs };
+}
+
+
 function makePPMap(moves){
   const map={}; (moves||[]).slice(0,4).forEach(m=>{ map[m.name]= (m.pp|0) || 20; }); return map;
 }
@@ -610,12 +642,23 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       b.pp[yourMove.name] = Math.max(0, (b.pp[yourMove.name]|0) - 1);
       await setCurrentPP(b.you.id, req.session.player_id, b.pp);
     
-      // Enemy KO check → capture phase
+      // enemy KO check
       if ((b.enemy.hp|0) <= 0){
         b.log.push(`${b.enemy.name} fainted!`);
-        b.allowCapture = true;
+      
+        // Award XP immediately on KO
+        try{
+          const { updated, gain, msgs } = await awardXP(req.session.player_id, b.you, b.enemy.level|0);
+          b.you = updated;
+          const nm = await monName(updated);
+          b.log.push(`${nm} gained ${gain} XP!`);
+          msgs.forEach(m => b.log.push(m));
+        }catch(_){ /* non-fatal */ }
+      
+        b.allowCapture = true; // only now can capture
         return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
       }
+
     
       // --- Enemy acts AFTER you when no priority ---
       if (ePri === 0){
