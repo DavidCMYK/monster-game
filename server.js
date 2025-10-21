@@ -747,6 +747,50 @@ app.post('/api/monster/nickname', auth, async (req,res)=>{
   }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 
+// release a monster (out of battle only)
+app.post('/api/monster/release', auth, async (req,res)=>{
+  try{
+    // 1) forbid in-battle releases
+    if (battles.has(req.session.token)){
+      return res.status(409).json({ error:'in_battle' });
+    }
+
+    const monId = req.body?.id|0;
+    if (!monId) return res.status(400).json({ error:'bad_id' });
+
+    // 2) verify ownership
+    const { rows } = await pool.query(
+      `SELECT id FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
+      [monId, req.session.player_id]
+    );
+    if (!rows.length) return res.status(404).json({ error:'not_found' });
+
+    // 3) delete the monster
+    await pool.query(`DELETE FROM mg_monsters WHERE id=$1 AND owner_id=$2`, [monId, req.session.player_id]);
+
+    // 4) compact remaining slots 1..N for this owner (stable order by slot, id)
+    await pool.query(`
+      WITH ordered AS (
+        SELECT id,
+               ROW_NUMBER() OVER (PARTITION BY owner_id ORDER BY slot NULLS LAST, id) AS rn
+        FROM mg_monsters
+        WHERE owner_id = $1
+      )
+      UPDATE mg_monsters m
+         SET slot = o.rn
+        FROM ordered o
+       WHERE m.id = o.id
+    `, [req.session.player_id]);
+
+    // 5) return updated party
+    const updated = await getParty(req.session.player_id);
+    return res.json({ ok:true, party: updated });
+  }catch(e){
+    console.error('release error:', e);
+    return res.status(500).json({ error:'server_error' });
+  }
+});
+
 /* ---------- species & chunk ---------- */
 app.get('/api/species', async (_req,res)=>{
   try{
