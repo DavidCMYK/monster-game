@@ -92,6 +92,16 @@ async function initDB(){
      WHERE m.id = ranked.id AND m.slot IS NULL
   `);
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS current_pp JSONB`);
+  await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS learned_pool JSONB`);
+  await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS learn_list JSONB`);
+
+  // Defaults so all existing monsters start empty (as requested)
+  await pool.query(`ALTER TABLE mg_monsters ALTER COLUMN learned_pool SET DEFAULT '{"effects":[],"bonuses":[]}'::jsonb`);
+  await pool.query(`ALTER TABLE mg_monsters ALTER COLUMN learn_list   SET DEFAULT '{"effects":{},"bonuses":{}}'::jsonb`);
+
+  // Backfill any NULLs
+  await pool.query(`UPDATE mg_monsters SET learned_pool = '{"effects":[],"bonuses":[]}'::jsonb WHERE learned_pool IS NULL`);
+  await pool.query(`UPDATE mg_monsters SET learn_list   = '{"effects":{},"bonuses":{}}'::jsonb       WHERE learn_list   IS NULL`);
 
   const { rows: cnt } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_species`);
   if (cnt[0].c === 0){
@@ -157,7 +167,9 @@ async function getParty(player_id){
            ability,
            moves,
            slot,
-           growth
+           growth,
+           learned_pool,
+           learn_list
       FROM mg_monsters
      WHERE owner_id = $1
   ORDER BY COALESCE(slot, id) ASC, id ASC
@@ -165,6 +177,7 @@ async function getParty(player_id){
   `, [player_id]);
   return rows;
 }
+
 
 
 async function ensureHasParty(owner_id){
@@ -212,6 +225,92 @@ const EFFECT_POOL = {
   effects: ['dmg_phys','dmg_spec','buff_atk','buff_def','debuff_atk','debuff_def','heal_small','stun','dot_poison'],
   bonuses: ['high_crit','pierce_armor','life_steal','multi_hit','priority','accuracy_up']
 };
+
+/* ---------- learning: seen-traits list + learned pool ---------- */
+function normLearnState(lp, ll){
+  // learned_pool → arrays, unique
+  let learned = (lp && typeof lp === 'object') ? lp : { effects:[], bonuses:[] };
+  if (!Array.isArray(learned.effects)) learned.effects = [];
+  if (!Array.isArray(learned.bonuses)) learned.bonuses = [];
+  learned.effects = Array.from(new Set(learned.effects.map(String)));
+  learned.bonuses = Array.from(new Set(learned.bonuses.map(String)));
+
+  // learn_list → maps name->int (0-100)
+  let list = (ll && typeof ll === 'object') ? ll : { effects:{}, bonuses:{} };
+  if (typeof list.effects !== 'object' || Array.isArray(list.effects)) list.effects = {};
+  if (typeof list.bonuses !== 'object' || Array.isArray(list.bonuses)) list.bonuses = {};
+  return { learned, list };
+}
+
+async function loadLearnState(monId){
+  const { rows } = await pool.query(`SELECT learned_pool, learn_list FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId|0]);
+  const lp = rows[0]?.learned_pool, ll = rows[0]?.learn_list;
+  return normLearnState(lp, ll);
+}
+
+async function saveLearnState(ownerId, monId, learned, list){
+  await pool.query(
+    `UPDATE mg_monsters SET learned_pool=$1, learn_list=$2 WHERE id=$3 AND owner_id=$4`,
+    [learned, list, monId|0, ownerId|0]
+  );
+}
+
+// After you KO an enemy, add their effects/bonuses to your learn_list at +1% each occurrence.
+// If already present in learned_pool, ignore. If already in list, increment by 1 (cap 100).
+async function recordEncounteredTraits(ownerId, monId, enemyMoves){
+  const { learned, list } = await loadLearnState(monId);
+  const learnedE = new Set(learned.effects);
+  const learnedB = new Set(learned.bonuses);
+
+  const effMap = list.effects;
+  const bonMap = list.bonuses;
+
+  const moves = Array.isArray(enemyMoves) ? enemyMoves.slice(0, 4) : [];
+  for (const m of moves){
+    const stacks  = Array.isArray(m?.stack)   ? m.stack   : [];
+    const bonuses = Array.isArray(m?.bonuses) ? m.bonuses : [];
+    for (const e of stacks.map(String)){
+      if (learnedE.has(e)) continue;
+      effMap[e] = Math.min(100, (parseInt(effMap[e]||0,10) || 0) + 1);
+    }
+    for (const b of bonuses.map(String)){
+      if (learnedB.has(b)) continue;
+      bonMap[b] = Math.min(100, (parseInt(bonMap[b]||0,10) || 0) + 1);
+    }
+  }
+
+  await saveLearnState(ownerId, monId, learned, { effects: effMap, bonuses: bonMap });
+}
+
+// On each level-up, roll once for every entry in learn_list.
+// If roll succeeds (rand 1..100 <= chance), move it to learned_pool and remove from the list.
+function applyLevelUpLearning(learned, list, rng=Math.random){
+  const gained = { effects:[], bonuses:[] };
+
+  const rollSide = (map, poolArr, gainedArr)=>{
+    for (const name of Object.keys(map)){
+      const chance = Math.max(0, Math.min(100, parseInt(map[name]||0, 10) || 0));
+      if (chance <= 0) continue;
+      const roll = Math.floor(rng()*100) + 1;  // 1..100
+      if (roll <= chance){
+        // learn it
+        if (!poolArr.includes(name)) poolArr.push(name);
+        gainedArr.push(name);
+        delete map[name];
+      }
+    }
+  };
+
+  rollSide(list.effects, learned.effects, gained.effects);
+  rollSide(list.bonuses, learned.bonuses, gained.bonuses);
+
+  // keep pools unique
+  learned.effects = Array.from(new Set(learned.effects));
+  learned.bonuses = Array.from(new Set(learned.bonuses));
+
+  return { learned, list, gained };
+}
+
 
 /* ---------- stat helpers (species + growth → derived stats) ---------- */
 function levelCurve(L){
@@ -560,10 +659,15 @@ async function awardXP(ownerId, mon, enemyLevel){
   const srow = await getSpeciesRow(mon.species_id);
   const growth = mon.growth || {};
 
+  // Load current learn state
+  let { learned, list } = await loadLearnState(mon.id);
+
+  // Level-up loop
   while (xp >= xpNeeded(level)){
     xp -= xpNeeded(level);
     level += 1;
 
+    // Recompute derived to update HP progression
     const derived = srow ? deriveStats(srow, growth, level) : { HP: max_hp + 4 };
     const oldMax = max_hp;
     max_hp = Math.max(1, derived.HP | 0);
@@ -572,11 +676,35 @@ async function awardXP(ownerId, mon, enemyLevel){
 
     const nm = await monName(mon);
     msgs.push(`${nm} grew to Lv${level}!`);
+
+    // On each level-up: roll for entries in learn_list
+    const beforeEffects = learned.effects.length;
+    const beforeBonuses = learned.bonuses.length;
+
+    const rolled = applyLevelUpLearning(learned, list);
+    learned = rolled.learned;
+    list = rolled.list;
+
+    // Announce anything gained
+    const newEffects = (learned.effects.length - beforeEffects);
+    const newBonuses = (learned.bonuses.length - beforeBonuses);
+
+    if (newEffects > 0){
+      const justGained = rolled.gained.effects;
+      justGained.forEach(n => msgs.push(`Learned effect: ${n}`));
+    }
+    if (newBonuses > 0){
+      const justGained = rolled.gained.bonuses;
+      justGained.forEach(n => msgs.push(`Learned bonus: ${n}`));
+    }
   }
 
+  // Persist stats and learning state
   await pool.query(
-    `UPDATE mg_monsters SET xp=$1, level=$2, hp=$3, max_hp=$4 WHERE id=$5 AND owner_id=$6`,
-    [xp, level, hp, max_hp, mon.id, ownerId]
+    `UPDATE mg_monsters
+        SET xp=$1, level=$2, hp=$3, max_hp=$4, learned_pool=$5, learn_list=$6
+      WHERE id=$7 AND owner_id=$8`,
+    [xp, level, hp, max_hp, learned, list, mon.id, ownerId]
   );
 
   const { rows } = await pool.query(
@@ -587,8 +715,6 @@ async function awardXP(ownerId, mon, enemyLevel){
   );
   return { updated: rows[0], gain, msgs };
 }
-
-
 
 function makePPMap(moves){
   const map={}; (moves||[]).slice(0,4).forEach(m=>{ map[m.name]= (m.pp|0) || 20; }); return map;
@@ -833,7 +959,12 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       if ((b.enemy.hp|0) <= 0){
         b.log.push(`${b.enemy.name} fainted!`);
       
-        // Award XP immediately on KO
+        // 1) Add enemy move traits to your learn_list (+1% each)
+        try{
+          await recordEncounteredTraits(req.session.player_id, b.you.id, b.enemy.moves || []);
+        }catch(_){ /* non-fatal */ }
+      
+        // 2) Award XP (this may trigger level-up learning rolls)
         try{
           const { updated, gain, msgs } = await awardXP(req.session.player_id, b.you, b.enemy.level|0);
           b.you = updated;
@@ -845,6 +976,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
         b.allowCapture = true; // only now can capture
         return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
       }
+
 
     
       // --- Enemy acts AFTER you when no priority ---
