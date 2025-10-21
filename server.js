@@ -53,6 +53,7 @@ async function initDB(){
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_species (id INT PRIMARY KEY, name TEXT NOT NULL, base_spawn_rate REAL NOT NULL DEFAULT 0.05, biomes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[], types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]);`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_monsters (id SERIAL PRIMARY KEY, owner_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, species_id INT NOT NULL REFERENCES mg_species(id), nickname TEXT, level INT NOT NULL DEFAULT 1, xp INT NOT NULL DEFAULT 0, hp INT NOT NULL DEFAULT 20, max_hp INT NOT NULL DEFAULT 20, ability TEXT, moves JSONB DEFAULT '[]'::jsonb);`);
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS slot INT`);
+  await pool.query(`UPDATE mg_monsters SET slot = id WHERE slot IS NULL`);
   await pool.query(`
     WITH ranked AS (
       SELECT id, owner_id, ROW_NUMBER() OVER (PARTITION BY owner_id ORDER BY slot NULLS LAST, id) AS rn
@@ -93,8 +94,9 @@ async function createPlayer(email, handle, password){
     VALUES ($1,1,3,0,28,28,'rescue:blink','[
       {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]},
       {"name":"Guard","base":"status","power":0,"accuracy":1.0,"pp":15,"stack":["buff_def"]}
-    ]'::jsonb, 1)
+    ]'::jsonb, 10)
   `,[player_id]);
+
 
   return player_id;
 }
@@ -107,13 +109,14 @@ async function deleteSession(tok){ await pool.query(`DELETE FROM mg_sessions WHE
 async function getState(player_id){ const { rows } = await pool.query(`SELECT player_id,cx,cy,tx,ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`, [player_id]); return rows[0]||null; }
 async function setState(player_id,cx,cy,tx,ty){ await pool.query(`UPDATE mg_player_state SET cx=$1,cy=$2,tx=$3,ty=$4,updated_at=now() WHERE player_id=$5`,[cx,cy,tx,ty,player_id]); }
 async function getParty(player_id){
-  const { rows } = await pool.query(`
-    SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,slot
-    FROM   mg_monsters
-    WHERE  owner_id=$1
-    ORDER BY slot ASC, id ASC
-    LIMIT 6
-  `, [player_id]);
+  const { rows } = await pool.query(
+  `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,slot
+   FROM mg_monsters
+   WHERE owner_id=$1
+   ORDER BY COALESCE(slot, id) ASC, id ASC
+   LIMIT 6
+   `, [player_id]);
+
   return rows;
 }
 
