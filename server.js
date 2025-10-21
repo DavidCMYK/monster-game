@@ -729,6 +729,16 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
   }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 
+app.post('/api/battle/finish', auth, async (req,res)=>{
+  try{
+    // Clear any existing battle for this session
+    if (battles.has(req.session.token)) battles.delete(req.session.token);
+    return res.json({ ok:true });
+  }catch(e){
+    return res.status(500).json({ error:'server_error' });
+  }
+});
+
 /* ---------- server / ws ---------- */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
