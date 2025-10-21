@@ -424,58 +424,97 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       return res.json({ log:b.log, result:'escaped' });
     } else if (action === 'move'){
       const moveName = String(req.body.move||'').trim();
-      const move = (Array.isArray(b.you.moves)?b.you.moves:[]).find(m=>(m.name||'')===moveName) ||
-                   { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25 };
+      const yourMove = (Array.isArray(b.you.moves)?b.you.moves:[]).find(m=>(m.name||'')===moveName) ||
+                       { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25 };
       if (!b.pp) b.pp = await getCurrentPP(b.you);
-
-      if (b.pp[move.name] == null) b.pp[move.name] = (move.pp|0)||20;
-      if (b.pp[move.name] <= 0) return res.status(400).json({ error:'no_pp' });
-      // accuracy
-      if (Math.random() < (move.accuracy ?? 1.0)){
-        const dmg = calcDamage(move, b.you.level|0);
-        b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
-        b.log.push(`${move.name} hits for ${dmg}!`);
-      } else {
-        b.log.push(`${move.name} missed!`);
-      }
-      b.pp[move.name] = Math.max(0, (b.pp[move.name]|0) - 1);
-      await setCurrentPP(b.you.id, req.session.player_id, b.pp);
-
-      // enemy KO check
-      if ((b.enemy.hp|0) <= 0){
-        b.log.push(`${b.enemy.name} fainted!`);
-
-        b.allowCapture = true; // only now can capture
-        return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
-      }
-
-      // enemy's turn (simple strike)
-      if (Math.random() < 0.93){
-        const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
-        const cur = Math.max(0, (b.you.hp|0) - edmg);
-        await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [cur, b.you.id, req.session.player_id]);
-        b.you.hp = cur;
-        b.log.push(`${b.enemy.name} strikes back for ${edmg}!`);
-      } else {
-        b.log.push(`${b.enemy.name} missed!`);
-      }
-
-      // you KO check → auto-sub if possible
-      const refreshed = await getParty(req.session.player_id);
-      const idxAlive = firstAliveIndex(refreshed);
-      if ((b.you.hp|0) <= 0){
-        if (idxAlive >= 0){
-          const prevName = await monName(you); // 'you' is the pre-hit active from above
-          b.youIndex = idxAlive;
-          b.you = refreshed[idxAlive];
-          const nextName = await monName(b.you);
-          b.log.push(`${prevName} fainted! ${nextName} steps in.`);
+    
+      if (b.pp[yourMove.name] == null) b.pp[yourMove.name] = (yourMove.pp|0)||20;
+      if (b.pp[yourMove.name] <= 0) return res.status(400).json({ error:'no_pp' });
+    
+      // --- Enemy priority check (enemy can act BEFORE you) ---
+      const eMove = (Array.isArray(b.enemy.moves) && b.enemy.moves[0]) ||
+                    { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25, priority:0 };
+      const ePri  = (eMove.priority|0) || 0;
+    
+      if (ePri > 0){
+        if (Math.random() < (eMove.accuracy ?? 1.0)){
+          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const newHp = Math.max(0, (b.you.hp|0) - edmg);
+          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
+          b.you.hp = newHp;
+          b.log.push(`${b.enemy.name} (priority) hits for ${edmg}!`);
         } else {
-          battles.delete(req.session.token);
-          return res.json({ log:b.log, result:'you_team_wiped' });
+          b.log.push(`${b.enemy.name} (priority) missed!`);
+        }
+    
+        // If you fainted from priority hit → auto-sub and CANCEL your queued move
+        const refreshedP = await getParty(req.session.player_id);
+        const idxAliveP  = firstAliveIndex(refreshedP);
+        if ((b.you.hp|0) <= 0){
+          if (idxAliveP >= 0){
+            const prevName = await monName(b.you);
+            b.youIndex = idxAliveP;
+            b.you = refreshedP[idxAliveP];
+            const nextName = await monName(b.you);
+            b.pp = await getCurrentPP(b.you); // load PP for the new active
+            b.log.push(`${prevName} fainted! ${nextName} steps in.`);
+            return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
+          } else {
+            battles.delete(req.session.token);
+            return res.json({ log:b.log, result:'you_team_wiped' });
+          }
         }
       }
-
+    
+      // --- Your move (only if you're still alive here) ---
+      if (Math.random() < (yourMove.accuracy ?? 1.0)){
+        const dmg = calcDamage(yourMove, b.you.level|0);
+        b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
+        b.log.push(`${yourMove.name} hits for ${dmg}!`);
+      } else {
+        b.log.push(`${yourMove.name} missed!`);
+      }
+      b.pp[yourMove.name] = Math.max(0, (b.pp[yourMove.name]|0) - 1);
+      await setCurrentPP(b.you.id, req.session.player_id, b.pp);
+    
+      // Enemy KO check → capture phase
+      if ((b.enemy.hp|0) <= 0){
+        b.log.push(`${b.enemy.name} fainted!`);
+        b.allowCapture = true;
+        return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
+      }
+    
+      // --- Enemy acts AFTER you when no priority ---
+      if (ePri === 0){
+        if (Math.random() < (eMove.accuracy ?? 1.0)){
+          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const newHp = Math.max(0, (b.you.hp|0) - edmg);
+          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
+          b.you.hp = newHp;
+          b.log.push(`${b.enemy.name} strikes back for ${edmg}!`);
+        } else {
+          b.log.push(`${b.enemy.name} missed!`);
+        }
+    
+        // You KO check → auto-sub or wipe
+        const refreshed = await getParty(req.session.player_id);
+        const idxAlive  = firstAliveIndex(refreshed);
+        if ((b.you.hp|0) <= 0){
+          if (idxAlive >= 0){
+            const prevName = await monName(b.you);
+            b.youIndex = idxAlive;
+            b.you = refreshed[idxAlive];
+            const nextName = await monName(b.you);
+            b.pp = await getCurrentPP(b.you); // PP for the subbed-in mon
+            b.log.push(`${prevName} fainted! ${nextName} steps in.`);
+          } else {
+            battles.delete(req.session.token);
+            return res.json({ log:b.log, result:'you_team_wiped' });
+          }
+        }
+      }
+    
+      return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
     } else {
       return res.status(400).json({ error:'bad_action' });
     }
