@@ -10,6 +10,66 @@ const { Pool } = require('pg');
 const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
+// --- Learn-pool helpers ---
+function extractTraitsFromMoves(moves){
+  const seenEffects = new Set();
+  const seenBonuses = new Set();
+  const list = Array.isArray(moves) ? moves : [];
+  for (const mv of list){
+    const stack = Array.isArray(mv?.stack) ? mv.stack : [];
+    const bons  = Array.isArray(mv?.bonuses) ? mv.bonuses : [];
+    for (const e of stack){ if (e) seenEffects.add(String(e)); }
+    for (const b of bons){  if (b) seenBonuses.add(String(b)); }
+  }
+  return { effects: Array.from(seenEffects), bonuses: Array.from(seenBonuses) };
+}
+
+// Shape: learn_pool = { effects: { code: percent }, bonuses: { code: percent } }
+function ensureLearnPool(obj){
+  if (!obj.learn_pool || typeof obj.learn_pool !== 'object'){
+    obj.learn_pool = { effects:{}, bonuses:{} };
+  } else {
+    obj.learn_pool.effects = obj.learn_pool.effects || {};
+    obj.learn_pool.bonuses = obj.learn_pool.bonuses || {};
+  }
+}
+
+async function incrementLearnPoolForMonster(monsterId, effects, bonuses){
+  if (!monsterId) return;
+
+  // 1) fetch monster
+  const { rows } = await pool.query(
+    `SELECT id, moves, learn_pool FROM mg_monsters WHERE id=$1 LIMIT 1`,
+    [monsterId]
+  );
+  if (!rows.length) return;
+
+  const mon = rows[0];
+  // Parse JSONB fields defensively
+  try{ if (typeof mon.moves === 'string') mon.moves = JSON.parse(mon.moves); }catch{}
+  try{ if (typeof mon.learn_pool === 'string') mon.learn_pool = JSON.parse(mon.learn_pool); }catch{}
+
+  ensureLearnPool(mon);
+
+  // 2) bump by +1 percentage point per distinct trait seen
+  for (const code of effects){
+    const k = String(code);
+    const current = Number(mon.learn_pool.effects[k] || 0);
+    mon.learn_pool.effects[k] = Math.max(0, Math.min(100, current + 1));
+  }
+  for (const code of bonuses){
+    const k = String(code);
+    const current = Number(mon.learn_pool.bonuses[k] || 0);
+    mon.learn_pool.bonuses[k] = Math.max(0, Math.min(100, current + 1));
+  }
+
+  // 3) persist
+  await pool.query(
+    `UPDATE mg_monsters SET learn_pool=$1 WHERE id=$2`,
+    [JSON.stringify(mon.learn_pool), monsterId]
+  );
+}
+
 // --- Stack validation helpers (effects/bonuses) ---
 function _contentIndex(){
   const c = getContent() || {};
@@ -842,22 +902,65 @@ function makePPMap(moves){
 }
 
 async function buildEnemyFromTile(tile){
-  // very simple: pick a random species weighted a little by base_spawn_rate
+  // pick a random species weighted by base_spawn_rate
   const { rows } = await pool.query(`SELECT id,name,base_spawn_rate FROM mg_species ORDER BY id ASC`);
-  if (!rows.length) return { speciesId:1, name:'Fieldling', level:3, hp:20, max_hp:20, moves:[{name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25}] };
-  // weight
+  if (!rows.length){
+    return {
+      speciesId: 1, name: 'Fieldling', level: 3,
+      hp: 20, max_hp: 20,
+      moves: [{ name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25, stack:['dmg_phys'], bonuses:[] }]
+    };
+  }
+
   const w = rows.map(r=>Math.max(0.01, Number(r.base_spawn_rate)||0.05));
   const sum = w.reduce((a,b)=>a+b,0);
   let t=Math.random()*sum, pick=rows[0];
   for(let i=0;i<w.length;i++){ if ((t-=w[i])<=0){ pick = rows[i]; break; } }
+
   const level = 2 + Math.floor(Math.random()*3);
   const hp = 16 + level*4;
+
+  // --- Build a tiny stacked move from content (base + maybe 1 extra effect + maybe 1 bonus)
+  const c = getContent() || {};
+  const effects = Array.isArray(c.effects) ? c.effects : [];
+  const bonuses = Array.isArray(c.bonuses) ? c.bonuses : [];
+  const baseEligible = effects.filter(e=>{
+    const v = String(e.base_flag_eligible ?? e.base ?? e.is_base ?? '').toLowerCase();
+    return v==='1' || v==='true' || v==='yes';
+  }).map(e=>String(e.code||'').trim()).filter(Boolean);
+
+  // Fallbacks if content is empty
+  const base = baseEligible[0] || 'dmg_phys';
+
+  // 50% chance add an extra non-base effect if available
+  const extraEffects = effects.map(e=>String(e.code||'').trim())
+    .filter(code => code && code !== base);
+  const maybeExtra = (extraEffects.length>0 && Math.random()<0.5) ? [ extraEffects[Math.floor(Math.random()*extraEffects.length)] ] : [];
+
+  // 50% chance add a bonus
+  const bonusCodes = bonuses.map(b=>String(b.code||'').trim()).filter(Boolean);
+  const maybeBonus = (bonusCodes.length>0 && Math.random()<0.5) ? [ bonusCodes[Math.floor(Math.random()*bonusCodes.length)] ] : [];
+
+  // Validate & sanitize via the helper we added earlier
+  const v = validateAndSanitizeStack([base, ...maybeExtra], maybeBonus);
+  const stack = v.ok ? v.stack : [base];
+  const bonz  = v.ok ? v.bonuses : [];
+
+  // Temporary power/accuracy/pp (resolver will use stacks later)
+  const wildMove = {
+    name: 'Strike',
+    base: (stack[0]==='dmg_spec' ? 'special' : (stack[0]==='buff_def' ? 'status' : 'physical')),
+    power: 8, accuracy: 0.95, pp: 25,
+    stack, bonuses: bonz
+  };
+
   return {
     speciesId: pick.id, name: pick.name, level,
     hp, max_hp: hp,
-    moves: [{ name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25 }]
+    moves: [ wildMove ]
   };
 }
+
 
 app.post('/api/battle/start', auth, async (req,res)=>{
   try{
@@ -1167,17 +1270,12 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     const capDerived   = capSrow ? deriveStats(capSrow, capGrowth, capLevel) : { HP: Math.max(12, b.enemy.max_hp|0) };
     
     await pool.query(`
-      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,growth)
-      VALUES ($1,$2,$3,0,$4,$4,'wild','[
-        {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25}
-      ]'::jsonb, $5)
-    `, [req.session.player_id, capSpeciesId, capLevel, Math.max(1, capDerived.HP|0), JSON.stringify(capGrowth)]);
-
-    b.log.push(`Captured ${b.enemy.name}!`);
-    battles.delete(req.session.token);
-    res.json({ result:'captured', log:b.log });
-  }catch(e){ res.status(500).json({ error:'server_error' }); }
-});
+      INSERT INTO mg_monsters
+        b.log.push(`Captured ${b.enemy.name}!`);
+        battles.delete(req.session.token);
+        res.json({ result:'captured', log:b.log });
+      }catch(e){ res.status(500).json({ error:'server_error' }); }
+    });
 
 app.post('/api/battle/finish', auth, async (req,res)=>{
   try{
