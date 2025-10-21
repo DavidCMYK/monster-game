@@ -51,8 +51,35 @@ async function initDB(){
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_sessions (token TEXT PRIMARY KEY, player_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, created_at TIMESTAMPTZ DEFAULT now());`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_player_state (player_id INT PRIMARY KEY REFERENCES mg_players(id) ON DELETE CASCADE, cx INT NOT NULL DEFAULT 0, cy INT NOT NULL DEFAULT 0, tx INT NOT NULL DEFAULT 128, ty INT NOT NULL DEFAULT 128, updated_at TIMESTAMPTZ DEFAULT now());`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_species (id INT PRIMARY KEY, name TEXT NOT NULL, base_spawn_rate REAL NOT NULL DEFAULT 0.05, biomes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[], types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]);`);
+
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_hp  INT NOT NULL DEFAULT 40`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_phy INT NOT NULL DEFAULT 10`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_mag INT NOT NULL DEFAULT 10`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_def INT NOT NULL DEFAULT 10`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_res INT NOT NULL DEFAULT 10`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_spd INT NOT NULL DEFAULT 10`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_acc INT NOT NULL DEFAULT 95`);
+  await pool.query(`ALTER TABLE mg_species ADD COLUMN IF NOT EXISTS base_eva INT NOT NULL DEFAULT 5`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_monsters (id SERIAL PRIMARY KEY, owner_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, species_id INT NOT NULL REFERENCES mg_species(id), nickname TEXT, level INT NOT NULL DEFAULT 1, xp INT NOT NULL DEFAULT 0, hp INT NOT NULL DEFAULT 20, max_hp INT NOT NULL DEFAULT 20, ability TEXT, moves JSONB DEFAULT '[]'::jsonb);`);
+  
+  await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS growth JSONB`);
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS slot INT`);
+  await pool.query(`
+    UPDATE mg_monsters
+    SET growth = jsonb_build_object(
+      'HP', 1.00 + (random()*0.20 - 0.10),
+      'PHY',1.00 + (random()*0.20 - 0.10),
+      'MAG',1.00 + (random()*0.20 - 0.10),
+      'DEF',1.00 + (random()*0.20 - 0.10),
+      'RES',1.00 + (random()*0.20 - 0.10),
+      'SPD',1.00 + (random()*0.20 - 0.10),
+      'ACC',1.00 + (random()*0.10 - 0.05),
+      'EVA',1.00 + (random()*0.10 - 0.05)
+    )
+    WHERE growth IS NULL
+  `);
+
   await pool.query(`UPDATE mg_monsters SET slot = id WHERE slot IS NULL`);
   await pool.query(`
     WITH ranked AS (
@@ -89,17 +116,27 @@ async function createPlayer(email, handle, password){
   const { rows } = await pool.query(`INSERT INTO mg_players (email,handle,password_hash) VALUES ($1,$2,$3) RETURNING id`, [email,handle,hash]);
   const player_id = rows[0].id;
   await pool.query(`INSERT INTO mg_player_state (player_id,cx,cy,tx,ty) VALUES ($1,0,0,$2,$3)`, [player_id, Math.floor(CHUNK_W/2), Math.floor(CHUNK_H/2)]);
+  // pick your intended starter species id (keeping 1 for now) and level
+  const starterSpeciesId = 1;
+  const starterLevel = 3;
+  
+  // species + growth → derived stats for HP
+  const srow   = await getSpeciesRow(starterSpeciesId);
+  const growth = randomGrowth();
+  const derived = srow ? deriveStats(srow, growth, starterLevel) : { HP: 28 };
+  
   await pool.query(`
-    INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,slot)
-    VALUES ($1,1,3,0,28,28,'rescue:blink','[
+    INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,slot,growth)
+    VALUES ($1,$2,$3,0,$4,$4,'rescue:blink','[
       {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]},
       {"name":"Guard","base":"status","power":0,"accuracy":1.0,"pp":15,"stack":["buff_def"]}
-    ]'::jsonb, 10)
-  `,[player_id]);
+    ]'::jsonb, 10, $5)
+  `, [player_id, starterSpeciesId, starterLevel, Math.max(1, derived.HP|0), JSON.stringify(growth)]);
 
 
   return player_id;
 }
+
 async function createSession(player_id){ const t = token(); await pool.query(`INSERT INTO mg_sessions (token,player_id) VALUES ($1,$2)`, [t,player_id]); return t; }
 async function getSession(tok){
   const { rows } = await pool.query(`SELECT s.token, p.id AS player_id, p.email, p.handle FROM mg_sessions s JOIN mg_players p ON p.id=s.player_id WHERE s.token=$1 LIMIT 1`, [tok]);
@@ -109,14 +146,23 @@ async function deleteSession(tok){ await pool.query(`DELETE FROM mg_sessions WHE
 async function getState(player_id){ const { rows } = await pool.query(`SELECT player_id,cx,cy,tx,ty FROM mg_player_state WHERE player_id=$1 LIMIT 1`, [player_id]); return rows[0]||null; }
 async function setState(player_id,cx,cy,tx,ty){ await pool.query(`UPDATE mg_player_state SET cx=$1,cy=$2,tx=$3,ty=$4,updated_at=now() WHERE player_id=$5`,[cx,cy,tx,ty,player_id]); }
 async function getParty(player_id){
-  const { rows } = await pool.query(
-  `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,slot
-   FROM mg_monsters
-   WHERE owner_id=$1
-   ORDER BY COALESCE(slot, id) ASC, id ASC
-   LIMIT 6
-   `, [player_id]);
-
+  const { rows } = await pool.query(`
+    SELECT id,
+           species_id,
+           nickname,
+           level,
+           xp,
+           hp,
+           max_hp,
+           ability,
+           moves,
+           slot,
+           growth
+      FROM mg_monsters
+     WHERE owner_id = $1
+  ORDER BY COALESCE(slot, id) ASC, id ASC
+     LIMIT 6
+  `, [player_id]);
   return rows;
 }
 
@@ -124,13 +170,20 @@ async function getParty(player_id){
 async function ensureHasParty(owner_id){
   const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
   if ((rows[0]?.c||0) === 0){
+    const starterSpeciesId = 1;
+    const starterLevel = 3;
+    const srow   = await getSpeciesRow(starterSpeciesId);
+    const growth = randomGrowth();
+    const derived = srow ? deriveStats(srow, growth, starterLevel) : { HP: 28 };
+    
     await pool.query(`
-      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
-      VALUES ($1,1,3,0,28,28,'rescue:blink','[
+      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,growth)
+      VALUES ($1,$2,$3,0,$4,$4,'rescue:blink','[
         {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]},
         {"name":"Guard","base":"status","power":0,"accuracy":1.0,"pp":15,"stack":["buff_def"]}
-      ]'::jsonb)
-    `,[owner_id]);
+      ]'::jsonb, $5)
+    `, [owner_id, starterSpeciesId, starterLevel, Math.max(1, derived.HP|0), JSON.stringify(growth)]);
+
   }
 }
 async function ensureStarterMoves(owner_id){
@@ -159,6 +212,50 @@ const EFFECT_POOL = {
   effects: ['dmg_phys','dmg_spec','buff_atk','buff_def','debuff_atk','debuff_def','heal_small','stun','dot_poison'],
   bonuses: ['high_crit','pierce_armor','life_steal','multi_hit','priority','accuracy_up']
 };
+
+/* ---------- stat helpers (species + growth → derived stats) ---------- */
+function levelCurve(L){
+  L = Math.max(1, L|0);
+  return 1 + (L-1)*0.075; // simple curve; tweak later to match design doc
+}
+function statRound(x){ return Math.max(1, Math.round(Number(x)||0)); }
+
+async function getSpeciesRow(id){
+  const { rows } = await pool.query(`
+    SELECT id,name,types,
+           base_hp,base_phy,base_mag,base_def,base_res,base_spd,base_acc,base_eva
+    FROM mg_species WHERE id=$1 LIMIT 1
+  `,[id|0]);
+  return rows[0] || null;
+}
+
+function randomGrowth(){
+  return {
+    HP:  1.00 + (Math.random()*0.20 - 0.10),
+    PHY: 1.00 + (Math.random()*0.20 - 0.10),
+    MAG: 1.00 + (Math.random()*0.20 - 0.10),
+    DEF: 1.00 + (Math.random()*0.20 - 0.10),
+    RES: 1.00 + (Math.random()*0.20 - 0.10),
+    SPD: 1.00 + (Math.random()*0.20 - 0.10),
+    ACC: 1.00 + (Math.random()*0.10 - 0.05),
+    EVA: 1.00 + (Math.random()*0.10 - 0.05),
+  };
+}
+
+function deriveStats(speciesRow, growth, level){
+  const gp = (k, def=1)=> Number((growth||{})[k] ?? def);
+  const f  = levelCurve(level);
+  return {
+    HP:  statRound((speciesRow.base_hp  * gp('HP'))  * f),
+    PHY: statRound((speciesRow.base_phy * gp('PHY')) * f),
+    MAG: statRound((speciesRow.base_mag * gp('MAG')) * f),
+    DEF: statRound((speciesRow.base_def * gp('DEF')) * f),
+    RES: statRound((speciesRow.base_res * gp('RES')) * f),
+    SPD: statRound((speciesRow.base_spd * gp('SPD')) * f),
+    ACC: statRound((speciesRow.base_acc * gp('ACC'))), // usually not scaled by level
+    EVA: statRound((speciesRow.base_eva * gp('EVA'))), // usually not scaled by level
+  };
+}
 
 function buildPPFromMoves(mon){
   const map={}; (Array.isArray(mon.moves)?mon.moves:[]).slice(0,4).forEach(m=>{
@@ -318,9 +415,29 @@ app.post('/api/monster/nickname', auth, async (req,res)=>{
 
 /* ---------- species & chunk ---------- */
 app.get('/api/species', async (_req,res)=>{
-  try{ const { rows } = await pool.query(`SELECT id,name,base_spawn_rate,biomes,types FROM mg_species ORDER BY id ASC`); res.json({ species: rows }); }
-  catch(e){ res.status(500).json({ error:'server_error' }); }
+  try{
+    const { rows } = await pool.query(`
+      SELECT id,
+             name,
+             base_spawn_rate,
+             biomes,
+             types,
+             base_hp,
+             base_phy,
+             base_mag,
+             base_def,
+             base_res,
+             base_spd,
+             base_acc,
+             base_eva
+        FROM mg_species
+    ORDER BY id ASC`);
+    res.json({ species: rows });
+  }catch(e){
+    res.status(500).json({ error:'server_error' });
+  }
 });
+
 
 // helper to get a chunk from `world` in whatever shape the module exposes
 function getWorldChunk(cx, cy){
@@ -385,27 +502,74 @@ function aliveIndices(party){
   return out;
 }
 
-function calcDamage(move, atkLevel){
-  const power = (move.power|0) || 1;
-  const base = Math.max(1, Math.round(power + atkLevel*0.5));
-  return base;
+// --- Damage helpers (PHY/MAG vs DEF/RES) ---
+function moveKind(move){
+  const base = (move?.base||'').toLowerCase();
+  const stack = Array.isArray(move?.stack) ? move.stack.map(s=>String(s).toLowerCase()) : [];
+  if (base === 'status') return 'status';
+  if (base === 'physical' || stack.includes('dmg_phys')) return 'physical';
+  if (base === 'special'  || stack.includes('dmg_spec')) return 'special';
+  // default to physical if unspecified
+  return 'physical';
 }
 
-function xpNeeded(level){ return 20 + (level|0)*(level|0)*10; } // quadratic-ish curve
+async function getMonDerivedStats(mon){
+  // mon must have species_id, level, growth
+  const srow = await getSpeciesRow(mon.species_id);
+  if (!srow) return null;
+  return deriveStats(srow, mon.growth || {}, mon.level|0);
+}
+
+async function getEnemyDerivedStats(enemy){
+  // wild enemies use neutral growth (1.0 multipliers)
+  const srow = await getSpeciesRow(enemy.speciesId);
+  if (!srow) return null;
+  const neutral = { HP:1, PHY:1, MAG:1, DEF:1, RES:1, SPD:1, ACC:1, EVA:1 };
+  return deriveStats(srow, neutral, enemy.level|0);
+}
+
+async function calcDamage(attackerStats, defenderStats, move, attackerLevel){
+  const kind = moveKind(move);
+  if (kind === 'status') return 0;
+
+  const atk = kind === 'physical' ? (attackerStats?.PHY||10) : (attackerStats?.MAG||10);
+  const def = kind === 'physical' ? (defenderStats?.DEF||10) : (defenderStats?.RES||10);
+  const power = Math.max(1, (move.power|0) || 1);
+
+  // Simple but expressive curve: scales with move power, level, and stat ratio
+  const levelFactor = 0.6 + (Math.max(1, attackerLevel|0) * 0.08); // L1=0.68 … L10≈1.4 … L30≈3.0
+  const ratio = Math.max(0.25, Math.min(2.5, (atk / Math.max(1, def)))); // clamp extremes
+  const raw = power * levelFactor * ratio;
+
+  return Math.max(1, Math.round(raw));
+}
+
+
+function xpNeeded(level){
+  return 20 + (level | 0) * (level | 0) * 10;
+}
 
 async function awardXP(ownerId, mon, enemyLevel){
-  const gain = Math.max(5, Math.round(10 + (enemyLevel|0)*4));
-  let xp = (mon.xp|0) + gain;
-  let level = mon.level|0;
-  let hp = mon.hp|0;
-  let max_hp = mon.max_hp|0;
+  const gain = Math.max(5, Math.round(10 + (enemyLevel | 0) * 4));
+  let xp = (mon.xp | 0) + gain;
+  let level = mon.level | 0;
+  let hp = mon.hp | 0;
+  let max_hp = mon.max_hp | 0;
   const msgs = [];
+
+  const srow = await getSpeciesRow(mon.species_id);
+  const growth = mon.growth || {};
 
   while (xp >= xpNeeded(level)){
     xp -= xpNeeded(level);
     level += 1;
-    max_hp += 4;                 // simple stat growth
-    hp = Math.min(max_hp, hp+4); // small heal on level-up
+
+    const derived = srow ? deriveStats(srow, growth, level) : { HP: max_hp + 4 };
+    const oldMax = max_hp;
+    max_hp = Math.max(1, derived.HP | 0);
+    const delta = Math.max(0, max_hp - oldMax);
+    hp = Math.min(max_hp, hp + Math.max(2, Math.ceil(delta * 0.5)));
+
     const nm = await monName(mon);
     msgs.push(`${nm} grew to Lv${level}!`);
   }
@@ -414,12 +578,16 @@ async function awardXP(ownerId, mon, enemyLevel){
     `UPDATE mg_monsters SET xp=$1, level=$2, hp=$3, max_hp=$4 WHERE id=$5 AND owner_id=$6`,
     [xp, level, hp, max_hp, mon.id, ownerId]
   );
+
   const { rows } = await pool.query(
-    `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves FROM mg_monsters WHERE id=$1 AND owner_id=$2`,
+    `SELECT id,species_id,nickname,level,xp,hp,max_hp,ability,moves,growth
+       FROM mg_monsters
+      WHERE id=$1 AND owner_id=$2`,
     [mon.id, ownerId]
   );
   return { updated: rows[0], gain, msgs };
 }
+
 
 
 function makePPMap(moves){
@@ -532,7 +700,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
       if (ePri > 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const defStats = await getMonDerivedStats(party[curIdx]);
+          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
+      
           const newHp = Math.max(0, (party[curIdx].hp|0) - edmg);
           await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, party[curIdx].id, req.session.player_id]);
           b.log.push(`${b.enemy.name} (priority) hits for ${edmg}!`);
@@ -553,7 +724,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
       if (ePri === 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const defStats = await getMonDerivedStats(b.you);
+          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
+
           const newHp = Math.max(0, (b.you.hp|0) - edmg);
           await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
           b.you.hp = newHp;
@@ -605,7 +779,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
       if (ePri > 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const defStats = await getMonDerivedStats(b.you);
+          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
+
           const newHp = Math.max(0, (b.you.hp|0) - edmg);
           await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
           b.you.hp = newHp;
@@ -640,7 +817,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
       // --- Your move (only if you're still alive here) ---
       if (Math.random() < (yourMove.accuracy ?? 1.0)){
-        const dmg = calcDamage(yourMove, b.you.level|0);
+        const atkStats = await getMonDerivedStats(b.you);
+        const defStats = await getEnemyDerivedStats(b.enemy);
+        const dmg = await calcDamage(atkStats, defStats, yourMove, b.you.level|0);
+
         b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
         b.log.push(`${yourMove.name} hits for ${dmg}!`);
       } else {
@@ -670,7 +850,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       // --- Enemy acts AFTER you when no priority ---
       if (ePri === 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
+          const defStats = await getMonDerivedStats(b.you);
+          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
+
           const newHp = Math.max(0, (b.you.hp|0) - edmg);
           await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
           b.you.hp = newHp;
@@ -723,12 +906,19 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
       return res.json({ result:'failed', log:b.log, allowCapture:true });
     }
     // Add to party
+    // compute growth and derived HP for the captured species/level
+    const capSpeciesId = b.enemy.speciesId|0;
+    const capLevel     = b.enemy.level|0;
+    const capSrow      = await getSpeciesRow(capSpeciesId);
+    const capGrowth    = randomGrowth();
+    const capDerived   = capSrow ? deriveStats(capSrow, capGrowth, capLevel) : { HP: Math.max(12, b.enemy.max_hp|0) };
+    
     await pool.query(`
-      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves)
+      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,growth)
       VALUES ($1,$2,$3,0,$4,$4,'wild','[
         {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25}
-      ]'::jsonb)
-    `, [req.session.player_id, b.enemy.speciesId, b.enemy.level|0, Math.max(12, b.enemy.max_hp|0)]);
+      ]'::jsonb, $5)
+    `, [req.session.player_id, capSpeciesId, capLevel, Math.max(1, capDerived.HP|0), JSON.stringify(capGrowth)]);
 
     b.log.push(`Captured ${b.enemy.name}!`);
     battles.delete(req.session.token);
