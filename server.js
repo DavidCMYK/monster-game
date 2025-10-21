@@ -292,6 +292,11 @@ function firstAliveIndex(party){
   for (let i=0;i<party.length;i++) if ((party[i].hp|0)>0) return i;
   return -1;
 }
+function aliveIndices(party){
+  const out=[]; for (let i=0;i<party.length;i++) if ((party[i].hp|0)>0) out.push(i);
+  return out;
+}
+
 function calcDamage(move, atkLevel){
   const power = (move.power|0) || 1;
   const base = Math.max(1, Math.round(power + atkLevel*0.5));
@@ -333,7 +338,7 @@ app.post('/api/battle/start', auth, async (req,res)=>{
     const pp = await getCurrentPP(you);
 
 
-    const battle = { you, enemy, youIndex: idx, pp, log:[`A wild ${enemy.name} appears!`], allowCapture:false, owner_id:req.session.player_id };
+    const battle = { you, enemy, youIndex: idx, pp, log:[`A wild ${enemy.name} appears!`], allowCapture:false, owner_id:req.session.player_id, requireSwitch:false };
     battles.set(req.session.token, battle);
 
     res.json({ you, enemy, youIndex: idx, pp, log: battle.log, allowCapture: false });
@@ -346,6 +351,11 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     if (!b) return res.status(404).json({ error:'no_battle' });
     const action = (req.body?.action||'').toLowerCase();
 
+    // If your active fainted this round, you must switch before doing anything else
+    if (b.requireSwitch && action !== 'switch'){
+      return res.status(409).json({ error:'must_switch' });
+    }
+
     // refresh party entry used for "you" (HP may change between turns due to heal, etc.)
     const party = await getParty(req.session.player_id);
     let you = party[b.youIndex] || party[firstAliveIndex(party)];
@@ -355,12 +365,23 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     if (b.allowCapture) return res.status(409).json({ error:'capture_or_finish' });
 
     if (action === 'switch'){
-      const curIdx   = b.youIndex|0;
-      const targetIdx= Math.max(0, Math.min((req.body.index|0), party.length-1));
+      const party = await getParty(req.session.player_id);
+      const targetIdx = Math.max(0, Math.min((req.body.index|0), party.length-1));
       if (!party[targetIdx]) return res.status(400).json({ error:'bad_index' });
       if ((party[targetIdx].hp|0) <= 0) return res.status(400).json({ error:'target_fainted' });
     
-      // Enemy priority: act BEFORE the switch if priority > 0
+      // If we are in a forced switch phase, switching does NOT consume a turn and the enemy does NOT act again.
+      if (b.requireSwitch){
+        b.youIndex = targetIdx;
+        b.you = party[targetIdx];
+        b.pp = await getCurrentPP(b.you);
+        b.requireSwitch = false;
+        b.log.push(`You sent out ${await monName(b.you)}.`);
+        return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
+      }
+    
+      // Normal (non-forced) switch still consumes your turn; enemy may act (as before)
+      const curIdx = b.youIndex|0;
       const eMove = (Array.isArray(b.enemy.moves) && b.enemy.moves[0]) ||
                     { name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25, priority:0 };
       const ePri  = (eMove.priority|0) || 0;
@@ -370,7 +391,6 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
           const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
           const newHp = Math.max(0, (party[curIdx].hp|0) - edmg);
           await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, party[curIdx].id, req.session.player_id]);
-          party[curIdx].hp = newHp;
           b.log.push(`${b.enemy.name} (priority) hits for ${edmg}!`);
         } else {
           b.log.push(`${b.enemy.name} (priority) missed!`);
@@ -382,15 +402,11 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
         }
       }
     
-      // Perform the switch (this consumes your turn)
       b.youIndex = targetIdx;
       b.you = party[targetIdx];
       b.pp = await getCurrentPP(b.you);
-
       b.log.push(`You switched to ${await monName(b.you)}.`);
-
     
-      // If NO priority, enemy acts AFTER the switch (hits the new active)
       if (ePri === 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
           const edmg = Math.max(1, Math.round(6 + (b.enemy.level|0)*0.6));
@@ -402,14 +418,21 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
           b.log.push(`${b.enemy.name} missed!`);
         }
     
-        // KO check after being hit post-switch → auto-sub or wipe
         const refreshed = await getParty(req.session.player_id);
         const idxAlive = firstAliveIndex(refreshed);
         if ((b.you.hp|0) <= 0){
-          if (idxAlive >= 0){
-            b.youIndex = idxAlive;
-            b.you = refreshed[idxAlive];
-            b.log.push(`Your switched-in monster fainted! ${b.you.nickname?.trim() || 'Next monster'} steps in.`);
+          const alives = aliveIndices(refreshed);
+          if (alives.length > 0){
+            if (alives.length === 1){
+              b.youIndex = alives[0]; b.you = refreshed[alives[0]];
+              b.pp = await getCurrentPP(b.you);
+              b.log.push(`${await monName(refreshed[curIdx])} fainted! ${await monName(b.you)} steps in.`);
+            } else {
+              // forced switch next round start
+              b.requireSwitch = true;
+              b.log.push(`Your monster fainted! Choose a replacement.`);
+              return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:true });
+            }
           } else {
             battles.delete(req.session.token);
             return res.json({ log:b.log, result:'you_team_wiped' });
@@ -417,7 +440,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
         }
       }
     
-      return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
+      return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
     } else if (action === 'run'){
       b.log.push(`You ran away.`);
       battles.delete(req.session.token);
@@ -449,20 +472,25 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
         // If you fainted from priority hit → auto-sub and CANCEL your queued move
         const refreshedP = await getParty(req.session.player_id);
-        const idxAliveP  = firstAliveIndex(refreshedP);
+        const alivesP = aliveIndices(refreshedP);
         if ((b.you.hp|0) <= 0){
-          if (idxAliveP >= 0){
-            const prevName = await monName(b.you);
-            b.youIndex = idxAliveP;
-            b.you = refreshedP[idxAliveP];
-            const nextName = await monName(b.you);
-            b.pp = await getCurrentPP(b.you); // load PP for the new active
-            b.log.push(`${prevName} fainted! ${nextName} steps in.`);
-            return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
-          } else {
+          if (alivesP.length === 0){
             battles.delete(req.session.token);
             return res.json({ log:b.log, result:'you_team_wiped' });
           }
+          if (alivesP.length === 1){
+            // Auto-sub the only survivor; CANCEL your queued move; round ends here
+            const prevName = await monName(b.you);
+            b.youIndex = alivesP[0];
+            b.you = refreshedP[alivesP[0]];
+            b.pp = await getCurrentPP(b.you);
+            b.log.push(`${prevName} fainted! ${await monName(b.you)} steps in.`);
+            return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
+          }
+          // Multiple choices → force switch; CANCEL your queued move; round ends here
+          b.requireSwitch = true;
+          b.log.push(`Your monster fainted! Choose a replacement.`);
+          return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:true });
         }
       }
     
@@ -498,19 +526,23 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
         // You KO check → auto-sub or wipe
         const refreshed = await getParty(req.session.player_id);
-        const idxAlive  = firstAliveIndex(refreshed);
+        const alives = aliveIndices(refreshed);
         if ((b.you.hp|0) <= 0){
-          if (idxAlive >= 0){
-            const prevName = await monName(b.you);
-            b.youIndex = idxAlive;
-            b.you = refreshed[idxAlive];
-            const nextName = await monName(b.you);
-            b.pp = await getCurrentPP(b.you); // PP for the subbed-in mon
-            b.log.push(`${prevName} fainted! ${nextName} steps in.`);
-          } else {
+          if (alives.length === 0){
             battles.delete(req.session.token);
             return res.json({ log:b.log, result:'you_team_wiped' });
           }
+          if (alives.length === 1){
+            const prevName = await monName(b.you);
+            b.youIndex = alives[0];
+            b.you = refreshed[alives[0]];
+            b.pp = await getCurrentPP(b.you);
+            b.log.push(`${prevName} fainted! ${await monName(b.you)} steps in.`);
+            return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
+          }
+          b.requireSwitch = true;
+          b.log.push(`Your monster fainted! Choose a replacement.`);
+          return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:true });
         }
       }
     
