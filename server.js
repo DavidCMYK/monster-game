@@ -148,6 +148,69 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
   return { ok:true, stack: filtered, bonuses };
 }
 
+// --- Per-effect resolver helpers (accuracy & PP from base effect) ---
+function getEffectRowByCode(code){
+  const c = getContent() || {};
+  const list = Array.isArray(c.effects) ? c.effects : [];
+  const k = String(code || '').trim();
+  return list.find(e => String(e.code || '').trim() === k) || null;
+}
+
+function computePPFromBaseEffect(stack, fallbackPP=20){
+  const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
+  if (!baseCode) return fallbackPP|0;
+  const row = getEffectRowByCode(baseCode);
+  const csvPP = row && row.base_pp != null ? Number(row.base_pp) : null;
+  if (csvPP != null && !Number.isNaN(csvPP) && csvPP > 0) return csvPP|0;
+  return fallbackPP|0;
+}
+
+
+function getBonusCodes(bonuses){
+  return Array.isArray(bonuses) ? bonuses.map(b => String(b).trim()) : [];
+}
+
+// Return accuracy for a single effect code, using CSV `accuracy` if available,
+// otherwise fall back to the move's accuracy (or 0.95).
+function perEffectAccuracy(effectCode, move, bonuses){
+  const row = getEffectRowByCode(effectCode);
+  let acc = (row && row.accuracy != null) ? Number(row.accuracy) : (move.accuracy ?? 0.95);
+
+  // Simple bonus: if the move has 'accuracy_up', add +0.10 (cap at 0.99).
+  const bon = getBonusCodes(bonuses);
+  if (bon.includes('accuracy_up')) acc += 0.10;
+
+  acc = Math.max(0.05, Math.min(0.99, Number(acc) || 0.95));
+  return acc;
+}
+
+// Resolve a single effect (hit/miss). For damage effects, apply damage and return { hit, dmg }.
+// For non-damage, just log that it applied (mechanics can be added later).
+async function resolveSingleEffect(effectCode, move, attacker, defender, b){
+  const acc = perEffectAccuracy(effectCode, move, move?.bonuses);
+  const hit = Math.random() < acc;
+
+  if (!hit){
+    b.log.push(`${move.name} (${effectCode}) missed!`);
+    return { hit:false, dmg:0 };
+  }
+
+  // If it’s a damage effect, compute damage using a temporary move that only includes that effect.
+  if (effectCode === 'dmg_phys' || effectCode === 'dmg_spec'){
+    const tempMove = { ...move, stack:[effectCode] }; // force moveKind to read this single effect
+    const atkStats = await getMonDerivedStats(attacker);
+    const defStats = await getEnemyDerivedStats(defender);
+    const dmg = await calcDamage(atkStats, defStats, tempMove, attacker.level|0);
+    defender.hp = Math.max(0, (defender.hp|0) - dmg);
+    b.log.push(`${move.name} (${effectCode}) hits for ${dmg}!`);
+    return { hit:true, dmg };
+  }
+
+  // Non-damage effect: stub behavior for now
+  b.log.push(`${move.name} applied ${effectCode}.`);
+  return { hit:true, dmg:0 };
+}
+
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -628,16 +691,34 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     const newStack   = result.stack;
     const newBonuses = result.bonuses;
 
-    // Merge into existing move object; do not change name/power/etc here
-    moves[idx] = { ...(moves[idx]||{}), stack:newStack, bonuses:newBonuses };
+    // Recompute MAX PP from base effect
+    const prior = moves[idx] || {};
+    const newPP = computePPFromBaseEffect(newStack, (prior.pp|0) || 20);
+
+    // Merge into move object
+    moves[idx] = { ...prior, stack:newStack, bonuses:newBonuses, pp:newPP };
+
+    // Clamp CURRENT PP (do not refill here; refill happens on heal)
+    // Load current_pp to clamp only this move by name
+    const { rows: curRows } = await pool.query(
+      `SELECT current_pp FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
+      [monId, req.session.player_id]
+    );
+    let curMap = curRows[0]?.current_pp;
+    if (typeof curMap !== 'object' || curMap === null) curMap = {};
+    const mvName = String(moves[idx]?.name || '');
+    if (mvName){
+      const cur = (curMap[mvName]|0) || 0;
+      if (cur > newPP) curMap[mvName] = newPP; // clamp down if needed
+    }
 
     await pool.query(
-      `UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`,
-      [JSON.stringify(moves), monId, req.session.player_id]
+      `UPDATE mg_monsters SET moves=$1, current_pp=$2 WHERE id=$3 AND owner_id=$4`,
+      [JSON.stringify(moves), curMap, monId, req.session.player_id]
     );
 
-    // Helpful echo for the UI
     res.json({ ok:true, moves, sanitized:true });
+
   }catch(e){
     console.error('monster/move error:', e);
     res.status(500).json({ error:'server_error' });
@@ -946,13 +1027,15 @@ async function buildEnemyFromTile(tile){
   const stack = v.ok ? v.stack : [base];
   const bonz  = v.ok ? v.bonuses : [];
 
-  // Temporary power/accuracy/pp (resolver will use stacks later)
+  // Compute PP from base effect (CSV), keep simple power/accuracy for now
+  const pp = computePPFromBaseEffect(stack, 25);
   const wildMove = {
     name: 'Strike',
     base: (stack[0]==='dmg_spec' ? 'special' : (stack[0]==='buff_def' ? 'status' : 'physical')),
-    power: 8, accuracy: 0.95, pp: 25,
+    power: 8, accuracy: 0.95, pp,
     stack, bonuses: bonz
   };
+
 
   return {
     speciesId: pick.id, name: pick.name, level,
@@ -1166,28 +1249,45 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       }
     
       // --- Your move (only if you're still alive here) ---
-      if (Math.random() < (yourMove.accuracy ?? 1.0)){
-        const atkStats = await getMonDerivedStats(b.you);
-        const defStats = await getEnemyDerivedStats(b.enemy);
-        const dmg = await calcDamage(atkStats, defStats, yourMove, b.you.level|0);
-
-        b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
-        b.log.push(`${yourMove.name} hits for ${dmg}!`);
-      } else {
-        b.log.push(`${yourMove.name} missed!`);
+      if ((b.pp[yourMove.name] | 0) <= 0){
+        return res.status(400).json({ error:'no_pp' });
       }
+
+
+      // Resolve each effect in order; stop early if enemy faints
+      const stackList = Array.isArray(yourMove.stack) ? yourMove.stack.map(String) : [];
+      if (stackList.length === 0){
+        // Fallback to legacy single roll if no stack present
+        if (Math.random() < (yourMove.accuracy ?? 1.0)){
+          const atkStats = await getMonDerivedStats(b.you);
+          const defStats = await getEnemyDerivedStats(b.enemy);
+          const dmg = await calcDamage(atkStats, defStats, yourMove, b.you.level|0);
+          b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
+          b.log.push(`${yourMove.name} hits for ${dmg}!`);
+        } else {
+          b.log.push(`${yourMove.name} missed!`);
+        }
+      } else {
+        for (const effectCode of stackList){
+          const out = await resolveSingleEffect(effectCode, yourMove, b.you, b.enemy, b);
+          // If the enemy fainted at any point, stop further effects
+          if ((b.enemy.hp|0) <= 0) break;
+        }
+      }
+
+      // Consume PP: one per use (we’ll add PP-modifying bonuses later)
       b.pp[yourMove.name] = Math.max(0, (b.pp[yourMove.name]|0) - 1);
       await setCurrentPP(b.you.id, req.session.player_id, b.pp);
-    
+
       // enemy KO check
       if ((b.enemy.hp|0) <= 0){
         b.log.push(`${b.enemy.name} fainted!`);
-      
+
         // 1) Add enemy move traits to your learn_list (+1% each)
         try{
           await recordEncounteredTraits(req.session.player_id, b.you.id, b.enemy.moves || []);
         }catch(_){ /* non-fatal */ }
-      
+
         // 2) Award XP (this may trigger level-up learning rolls)
         try{
           const { updated, gain, msgs } = await awardXP(req.session.player_id, b.you, b.enemy.level|0);
@@ -1196,13 +1296,11 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
           b.log.push(`${nm} gained ${gain} XP!`);
           msgs.forEach(m => b.log.push(m));
         }catch(_){ /* non-fatal */ }
-      
+
         b.allowCapture = true; // only now can capture
         return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:true });
       }
 
-
-    
       // --- Enemy acts AFTER you when no priority ---
       if (ePri === 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
@@ -1255,27 +1353,47 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     if (!b) return res.status(404).json({ error:'no_battle' });
     if (!b.allowCapture) return res.status(409).json({ error:'not_allowed' });
 
-    // fixed odds (e.g., 60%) per spec: only after KO
+    // Placeholder capture odds (we'll swap to the spec formula later)
     const success = Math.random() < 0.6;
     if (!success){
       b.log.push('Capture failed.');
       return res.json({ result:'failed', log:b.log, allowCapture:true });
     }
-    // Add to party
-    // compute growth and derived HP for the captured species/level
+
+    // Preserve the enemy's stacked move(s) if present
+    const moves = Array.isArray(b.enemy.moves) && b.enemy.moves.length
+      ? b.enemy.moves
+      : [{ name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25, stack:['dmg_phys'], bonuses:[] }];
+
+    // Compute growth and derived HP for the captured species/level
     const capSpeciesId = b.enemy.speciesId|0;
     const capLevel     = b.enemy.level|0;
     const capSrow      = await getSpeciesRow(capSpeciesId);
     const capGrowth    = randomGrowth();
-    const capDerived   = capSrow ? deriveStats(capSrow, capGrowth, capLevel) : { HP: Math.max(12, b.enemy.max_hp|0) };
-    
+    const capDerived   = capSrow ? deriveStats(capSrow, capGrowth, capLevel)
+                                 : { HP: Math.max(12, b.enemy.max_hp|0) };
+
     await pool.query(`
-      INSERT INTO mg_monsters
-        b.log.push(`Captured ${b.enemy.name}!`);
-        battles.delete(req.session.token);
-        res.json({ result:'captured', log:b.log });
-      }catch(e){ res.status(500).json({ error:'server_error' }); }
-    });
+      INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,growth)
+      VALUES ($1,$2,$3,0,$4,$4,'wild',$5,$6)
+    `, [
+      req.session.player_id,
+      capSpeciesId,
+      capLevel,
+      Math.max(1, capDerived.HP|0),
+      JSON.stringify(moves),
+      JSON.stringify(capGrowth)
+    ]);
+
+    b.log.push(`Captured ${b.enemy.name}!`);
+    battles.delete(req.session.token);
+    return res.json({ result:'captured', log:b.log });
+  }catch(e){
+    console.error('capture error:', e);
+    return res.status(500).json({ error:'server_error' });
+  }
+});
+
 
 app.post('/api/battle/finish', auth, async (req,res)=>{
   try{
