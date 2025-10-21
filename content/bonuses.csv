@@ -1,0 +1,15 @@
+bonus_id,code,target_metric,value_type,value,cost,notes
+1,Damage+10%,damage,percent,10,1,
+2,Damage+5%,damage,percent,5,1,
+3,Accuracy+5%,accuracy,percent,5,1,
+4,Accuracy+10%,accuracy,percent,10,2,
+5,PP+1,pp,flat,1,1,Increases move PP; affects cost cap
+6,PP-1,pp,flat,-1,-1,Decreases move PP; frees cost budget
+7,Element:Fire,element,tag,Fire,1,
+8,Element:Water,element,tag,Water,1,
+9,Element:Flora,element,tag,Flora,1,
+10,Element:Earth,element,tag,Earth,1,
+11,Element:Air,element,tag,Air,1,
+12,Element:Ice,element,tag,Ice,1,
+13,Element:Electric,element,tag,Electric,1,
+14,Element:Fauna,element,tag,Fauna,1,

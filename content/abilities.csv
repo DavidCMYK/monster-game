@@ -1,0 +1,8 @@
+ability_id,name,rescue_flag,field_effect,battle_stack_effects,battle_stack_bonuses,notes
+1,Blink Escape,1,Teleport/intangible short burst to last safe tile or nearest safe zone,,,Ends battle; server-authoritative
+2,Burrow Retreat,1,Burrow to nearest guild/safe zone via earth paths,,,Ends battle; may fail on hard terrain
+3,Gale Uplift,1,Ride wind to nearest explored safe tile (same chunk),,,Ends battle; immune this turn
+10,Move Heavy Object,0,Push/pull heavy obstacles,,,
+11,Water Traverse,0,Cross rivers/lakes; enables fishing,,,
+12,Rock Climb,0,Scale steep cliffs / Z breaks,,,
+13,Phase Step,0,Pass through thin barriers briefly,,,Rare

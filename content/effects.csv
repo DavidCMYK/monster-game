@@ -1,0 +1,20 @@
+effect_id,code,desc,target,accuracy_base,cost,duration,base_flag_eligible,base_pp
+1,PhysicalDamage,Compute physical damage,enemy,100,2,0,1,25
+2,SpecialDamage,Compute special damage,enemy,100,2,0,1,25
+10,ApplySleep20,Apply Sleep (20%),enemy,85,2,0,1,15
+11,ApplyStun15,Apply Stun (15%),enemy,90,2,0,1,20
+12,ApplyConfuse25,Apply Confuse (25%),enemy,90,2,0,1,20
+13,ApplySilence20,Apply Silence (20%),enemy,90,2,0,1,15
+14,ApplyFreeze10,Apply Freeze (10%),enemy,85,2,0,1,10
+15,ApplyPoison10,Apply Poison (10%),enemy,95,2,0,1,20
+20,UserPHY+30,Increase user PHY by 30%,self,,2,-1,0,0
+21,UserMAG-10,Reduce user MAG by 10%,self,,-1,-1,0,0
+22,UserDEF-10,Reduce user DEF by 10%,self,,-1,-1,0,0
+23,UserRES-10,Reduce user RES by 10%,self,,-1,-1,0,0
+24,UserACC-10,Reduce user ACC by 10%,self,,-1,-1,0,0
+25,UserMAG+20,Increase user MAG by 20%,self,,2,-1,0,0
+26,UserACC+20,Increase user ACC by 20%,self,,2,-1,0,0
+27,UserDEF-10b,Reduce user DEF by 10%,self,,-1,-1,0,0
+28,UserEVA-10,Reduce user EVA by 10%,self,,-1,-1,0,0
+29,UserSPD+20(2),Increase SPD by 20% for 2 turns,self,,2,2,0,0
+30,TargetSPD-20(2),Reduce target SPD by 20% for 2 turns,enemy,95,2,2,0,0

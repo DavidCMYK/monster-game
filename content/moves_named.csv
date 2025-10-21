@@ -1,0 +1,7 @@
+move_id,name,stack_effects,stack_bonuses,notes
+1,Hyper,20|21|22|23|24,,Stack of atomic self stat changes
+2,Focus,25|26|27|28,,Stack of atomic self stat changes
+3,Ember Jab,1,7|2,PhysicalDamage + Element:Fire + Damage+5%
+4,Thorn Swipe,1|15,9,PhysicalDamage + ApplyPoison10 + Element:Flora
+5,Frost Nip,2|14,12,SpecialDamage + ApplyFreeze10 + Element:Ice
+6,Static Prick,2|12,13,SpecialDamage + ApplyConfuse25 + Element:Electric
