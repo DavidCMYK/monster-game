@@ -255,8 +255,13 @@ app.post('/api/party/reorder', auth, async (req,res)=>{
     await pool.query(`UPDATE mg_monsters SET slot=$1 WHERE id=$2 AND owner_id=$3`, [b.slot|0, a.id, req.session.player_id]);
     await pool.query(`UPDATE mg_monsters SET slot=$1 WHERE id=$2 AND owner_id=$3`, [a.slot|0, b.id, req.session.player_id]);
     await pool.query('COMMIT');
+    
 
     const updated = await getParty(req.session.player_id);
+
+    // Invalidate any cached battle for this session so next start is fresh
+    if (battles.has(req.session.token)) battles.delete(req.session.token);
+    
     res.json({ ok:true, party: updated });
   }catch(e){
     try{ await pool.query('ROLLBACK'); }catch(_){}
@@ -442,19 +447,21 @@ async function buildEnemyFromTile(tile){
 app.post('/api/battle/start', auth, async (req,res)=>{
   try{
     // If a battle already exists for this session, return it instead of creating a new one.
-    const existing = battles.get(req.session.token);
-    if (existing){
-      return res.json({
-        you: existing.you,
-        enemy: existing.enemy,
-        youIndex: existing.youIndex|0,
-        pp: existing.pp || {},
-        log: existing.log || [],
-        allowCapture: !!existing.allowCapture,
-        requireSwitch: !!existing.requireSwitch
-      });
-    }
-
+    //const existing = battles.get(req.session.token);
+    //if (existing){
+    //  return res.json({
+    //    you: existing.you,
+    //    enemy: existing.enemy,
+    //    youIndex: existing.youIndex|0,
+    //    pp: existing.pp || {},
+    //    log: existing.log || [],
+    //    allowCapture: !!existing.allowCapture,
+    //    requireSwitch: !!existing.requireSwitch
+    //  });
+    //}
+    // Instead, proactively discard any old battle:
+    if (battles.has(req.session.token)) battles.delete(req.session.token);
+    
     const party = await getParty(req.session.player_id);
     const idx = firstAliveIndex(party);
     if (idx<0) return res.status(409).json({ error:'you_fainted' });
