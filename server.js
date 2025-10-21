@@ -8,6 +8,8 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const world = require('./world');
+const { getContent, reloadContent } = require('./contentLoader');
+
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -27,6 +29,9 @@ const pool = new Pool({
 });
 
 const CHUNK_W = 256, CHUNK_H = 256;
+// --- Load content from CSV files at startup ---
+try { reloadContent(); } catch(e){ console.error('Content load failed:', e.message); }
+
 
 /* ---------- DB setup ---------- */
 async function normalizePlayerPositions(){ if (String(SKIP_NORMALIZE_ON_BOOT).toLowerCase() === 'true') return;
@@ -221,10 +226,6 @@ async function monName(mon){
   return await speciesNameById(mon.species_id);
 }
 
-const EFFECT_POOL = {
-  effects: ['dmg_phys','dmg_spec','buff_atk','buff_def','debuff_atk','debuff_def','heal_small','stun','dot_poison'],
-  bonuses: ['high_crit','pierce_armor','life_steal','multi_hit','priority','accuracy_up']
-};
 
 /* ---------- learning: seen-traits list + learned pool ---------- */
 function normLearnState(lp, ll){
@@ -465,11 +466,6 @@ app.post('/api/party/reorder', auth, async (req,res)=>{
   }
 });
 
-// pool of effects/bonuses for editing moves (can be made species/ability dependent later)
-app.get('/api/move-pool', auth, async (req,res)=>{
-  res.json(EFFECT_POOL);
-});
-
 // update a specific move's stack/bonuses for one monster
 app.post('/api/monster/move', auth, async (req,res)=>{
   try{
@@ -537,6 +533,33 @@ app.get('/api/species', async (_req,res)=>{
   }
 });
 
+/* ---------- content (effects/bonuses/moves) ---------- */
+app.get('/api/content/pool', auth, (req, res) => {
+  const c = getContent();
+  return res.json(c?.pool || { effects:[], bonuses:[] });
+});
+
+app.get('/api/content/effects', auth, (req, res) => {
+  const c = getContent();
+  return res.json({ effects: c?.effects || [], version: c?.version || 0 });
+});
+
+app.get('/api/content/bonuses', auth, (req, res) => {
+  const c = getContent();
+  return res.json({ bonuses: c?.bonuses || [], version: c?.version || 0 });
+});
+
+app.get('/api/content/moves_named', auth, (req, res) => {
+  const c = getContent();
+  return res.json({ moves: c?.named_moves || [], version: c?.version || 0 });
+});
+
+// Optional: quick admin-only reload (temporary guard: player_id === 1)
+app.post('/api/admin/content/reload', auth, (req, res) => {
+  if (req.session?.player_id !== 1) return res.status(403).json({ error:'forbidden' });
+  const c = reloadContent();
+  return res.json({ ok:true, version: c?.version || 0 });
+});
 
 // helper to get a chunk from `world` in whatever shape the module exposes
 function getWorldChunk(cx, cy){
