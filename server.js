@@ -268,13 +268,15 @@ function getBonusCodes(bonuses){
   return Array.isArray(bonuses) ? bonuses.map(b => String(b).trim()) : [];
 }
 
-// Return accuracy for a single effect code, using CSV `accuracy` if available,
-// otherwise fall back to the move's accuracy (or 0.95).
-function perEffectAccuracy(effectCode, move, bonuses){
+// accuracy for a single effect: prefer row.accuracy; fall back to move.accuracy; bonuses may tweak
+function perEffectAccuracy(effectCode, move, bonuses, isSelfTarget){
+  // self-target effects auto-hit per spec
+  if (isSelfTarget) return 0.99;
+
   const row = getEffectRowByCode(effectCode);
   let acc = (row && row.accuracy != null) ? Number(row.accuracy) : (move.accuracy ?? 0.95);
 
-  // Simple bonus: if the move has 'accuracy_up', add +0.10 (cap at 0.99).
+  // sample bonus: accuracy_up
   const bon = getBonusCodes(bonuses);
   if (bon.includes('accuracy_up')) acc += 0.10;
 
@@ -282,32 +284,82 @@ function perEffectAccuracy(effectCode, move, bonuses){
   return acc;
 }
 
-// Resolve a single effect (hit/miss). For damage effects, apply damage and return { hit, dmg }.
-// For non-damage, just log that it applied (mechanics can be added later).
+// effect resolver using DB fields: target ('target'|'self'), effect_type ('damage'|'status'|'stat_change'),
+// stat (channel for damage; which stat for stat_change; which status for status), amount (decimal for stat_change)
 async function resolveSingleEffect(effectCode, move, attacker, defender, b){
-  const acc = perEffectAccuracy(effectCode, move, move?.bonuses);
+  const row = getEffectRowByCode(effectCode) || {};
+  const targetKey = (String(row.target || 'target').toLowerCase() === 'self') ? 'self' : 'target';
+  const effectType = String(row.effect_type || '').toLowerCase();
+  const stat = String(row.stat || '').toUpperCase();         // e.g., 'PHY','MAG','DEF','SLEEP'
+  const amt  = (row.amount != null) ? Number(row.amount) : null;
+
+  // choose who is affected
+  const targetMon = (targetKey === 'self') ? attacker : defender;
+
+  // ACC roll (self-target = auto-hit)
+  const acc = perEffectAccuracy(effectCode, move, move?.bonuses, targetKey === 'self');
   const hit = Math.random() < acc;
 
   if (!hit){
-    b.log.push(`${move.name} (${effectCode}) missed!`);
+    b.log.push(`${move.name} (${effectCode}) missed.`);
     return { hit:false, dmg:0 };
   }
 
-  // If it’s a damage effect, compute damage using a temporary move that only includes that effect.
-  if (effectCode === 'dmg_phys' || effectCode === 'dmg_spec'){
-    const tempMove = { ...move, stack:[effectCode] }; // force moveKind to read this single effect
-    const atkStats = await getMonDerivedStats(attacker);
-    const defStats = await getEnemyDerivedStats(defender);
+  // --- DAMAGE ---
+  if (effectType === 'damage'){
+    // Determine channel from row.stat: PHY → physical, MAG → special (fallback physical)
+    const channel = (stat === 'MAG') ? 'dmg_spec' : 'dmg_phys';
+    const tempMove = { ...move, stack:[channel] };
+
+    // Use battle-aware stats (includes any prior stat_change effects)
+    const atkStats = await getBattleStats(attacker === b.you ? 'you' : 'enemy', b);
+    const defStats = await getBattleStats(targetMon === b.you ? 'you' : 'enemy', b);
+
     const dmg = await calcDamage(atkStats, defStats, tempMove, attacker.level|0);
-    defender.hp = Math.max(0, (defender.hp|0) - dmg);
-    b.log.push(`${move.name} (${effectCode}) hits for ${dmg}!`);
+    targetMon.hp = Math.max(0, (targetMon.hp|0) - dmg);
+    b.log.push(`${move.name} dealt ${dmg} damage.`);
     return { hit:true, dmg };
   }
 
-  // Non-damage effect: stub behavior for now
+  // --- STATUS ---
+  if (effectType === 'status'){
+    // We'll keep status in battle memory for now (DB field for status may not exist yet in your table)
+    // Only one negative status at a time (spec). If empty or 'none', apply.
+    const cur = String(targetMon.status_neg || 'none').toLowerCase();
+    if (cur !== 'none'){
+      b.log.push(`${move.name}: status attempt ignored (already has ${cur}).`);
+      return { hit:true, dmg:0 };
+    }
+    // row.stat holds which status to apply, e.g., 'SLEEP','STUN','POISON'
+    const next = stat ? stat.toLowerCase() : 'status';
+    targetMon.status_neg = next;
+    b.log.push(`${move.name} inflicted ${next}.`);
+    return { hit:true, dmg:0 };
+  }
+
+  // --- STAT CHANGE ---
+  if (effectType === 'stat_change'){
+    // amt is fractional (e.g., +0.20 or -0.10), applies until battle end
+    if (!b.mods) b.mods = { you:{}, enemy:{} };
+    const bucket = (targetMon === b.you) ? (b.mods.you = b.mods.you || {}) : (b.mods.enemy = b.mods.enemy || {});
+
+    // accepted stats: HP/PHY/MAG/DEF/RES/SPD/ACC/EVA (ignore others gracefully)
+    const allowed = ['HP','PHY','MAG','DEF','RES','SPD','ACC','EVA'];
+    if (allowed.includes(stat) && typeof amt === 'number' && amt !== 0){
+      bucket[stat] = Number(bucket[stat] || 0) + amt; // stackable
+      const sign = amt > 0 ? '+' : '';
+      b.log.push(`${move.name} ${targetKey === 'self' ? 'raised' : 'changed'} ${stat} by ${sign}${Math.round(amt*100)}%.`);
+    } else {
+      b.log.push(`${move.name} applied a stat change (ignored: unknown stat or amount).`);
+    }
+    return { hit:true, dmg:0 };
+  }
+
+  // fallback: unknown type → just log
   b.log.push(`${move.name} applied ${effectCode}.`);
   return { hit:true, dmg:0 };
 }
+
 
 
 const app = express();
@@ -1704,6 +1756,35 @@ app.post('/api/sync', auth, async (req,res)=>{
 // in-memory battle state keyed by session token
 const battles = new Map();
 
+// Apply % mods like { PHY:+0.30, DEF:-0.10 } to a derived stat set
+function applyStatMods(derived, mods){
+  if (!derived) return null;
+  const out = { ...derived };
+  if (!mods || typeof mods !== 'object') return out;
+  const keys = ['HP','PHY','MAG','DEF','RES','SPD','ACC','EVA'];
+  for (const k of keys){
+    if (typeof mods[k] === 'number'){
+      const base = Number(derived[k] || 0);
+      const mult = 1 + Number(mods[k]);
+      out[k] = Math.max(1, Math.round(base * mult));
+    }
+  }
+  return out;
+}
+
+// Get battle-aware stats (derived + any active temporary modifiers)
+// side ∈ 'you' | 'enemy'; for enemy we use neutral growth per existing helper
+async function getBattleStats(side, b){
+  if (side === 'you'){
+    const d = await getMonDerivedStats(b.you);
+    return applyStatMods(d, b?.mods?.you);
+  } else {
+    const d = await getEnemyDerivedStats(b.enemy);
+    return applyStatMods(d, b?.mods?.enemy);
+  }
+}
+
+
 function firstAliveIndex(party){
   for (let i=0;i<party.length;i++) if ((party[i].hp|0)>0) return i;
   return -1;
@@ -2045,8 +2126,8 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
       if (ePri === 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getMonDerivedStats(b.you);
-          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const defStats = await getBattleStats('you', b);
+          const atkStats = await getBattleStats('enemy', b);
           const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
 
           const newHp = Math.max(0, (b.you.hp|0) - edmg);
@@ -2115,8 +2196,8 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
     
       if (ePri > 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getMonDerivedStats(b.you);
-          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const defStats = await getBattleStats('you', b);
+          const atkStats = await getBattleStats('enemy', b);
           const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
 
           const newHp = Math.max(0, (b.you.hp|0) - edmg);
@@ -2164,8 +2245,9 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
         // Fallback if a move somehow has no stack: simple 95% hit, fixed power
         const fallbackAcc = 0.95;
         if (Math.random() < fallbackAcc){
-          const atkStats = await getMonDerivedStats(b.you);
-          const defStats = await getEnemyDerivedStats(b.enemy);
+          const atkStats = await getBattleStats('you', b);
+          const defStats = await getBattleStats('enemy', b);
+
           const tempMove = { name: visibleName, base:'physical', power:8, accuracy:fallbackAcc, stack:['dmg_phys'], bonuses:[] };
           const dmg = await calcDamage(atkStats, defStats, tempMove, b.you.level|0);
           b.enemy.hp = Math.max(0, (b.enemy.hp|0) - dmg);
@@ -2214,8 +2296,8 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       // --- Enemy acts AFTER you when no priority ---
       if (ePri === 0){
         if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getMonDerivedStats(b.you);
-          const atkStats = await getEnemyDerivedStats(b.enemy);
+          const defStats = await getBattleStats('you', b);
+          const atkStats = await getBattleStats('enemy', b);
           const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
 
           const newHp = Math.max(0, (b.you.hp|0) - edmg);
