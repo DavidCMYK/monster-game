@@ -156,6 +156,50 @@ function getEffectRowByCode(code){
   return list.find(e => String(e.code || '').trim() === k) || null;
 }
 
+// --- Canonicalization + move-name registry ---
+function canonicalizeStackAndBonuses(stack, bonuses){
+  // Both arrays of strings, trimmed, with base effect already validated/first
+  const s = Array.isArray(stack) ? stack.map(x=>String(x).trim()).filter(Boolean) : [];
+  const b = Array.isArray(bonuses) ? bonuses.map(x=>String(x).trim()).filter(Boolean) : [];
+  // keep order on stack (base enforced first by validate) and sort bonuses for stable key
+  const bon = b.slice().sort();
+  const key = `${s.join('|')}§${bon.join('|')}`;
+  return { s, bon, key };
+}
+
+// For now: generate name as "effect1+effect2+... [+ bonus1+bonus2...]"
+function generatedMoveName(stack, bonuses){
+  const left = (Array.isArray(stack)?stack:[]).join('+');
+  const right = (Array.isArray(bonuses)&&bonuses.length) ? ('+' + bonuses.join('+')) : '';
+  return (left + right) || 'Custom';
+}
+
+// Ensure there is a row in mg_moves for this exact combo; return its name
+async function ensureMoveRecord(stack, bonuses){
+  const { s, bon } = canonicalizeStackAndBonuses(stack, bonuses);
+
+  // try to find existing by canonical key (using the same md5 logic)
+  const { rows: found } = await pool.query(
+    `
+    SELECT name
+      FROM mg_moves
+     WHERE md5(COALESCE(array_to_string(stack,'│'),'') || '§' || COALESCE(array_to_string(bonuses,'│'),''))
+           = md5($1 || '§' || $2)
+     LIMIT 1
+    `,
+    [ s.join('│'), bon.join('│') ]
+  );
+  if (found.length) return String(found[0].name || '');
+
+  // insert new
+  const name = generatedMoveName(s, bon);
+  const { rows: ins } = await pool.query(
+    `INSERT INTO mg_moves(name, stack, bonuses) VALUES ($1,$2,$3) RETURNING name`,
+    [ name, s, bon ]
+  );
+  return String(ins[0].name || name);
+}
+
 function computePPFromBaseEffect(stack, fallbackPP=20){
   const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
   if (!baseCode) return fallbackPP|0;
@@ -269,6 +313,27 @@ async function initDB(){
 
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_monsters (id SERIAL PRIMARY KEY, owner_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, species_id INT NOT NULL REFERENCES mg_species(id), nickname TEXT, level INT NOT NULL DEFAULT 1, xp INT NOT NULL DEFAULT 0, hp INT NOT NULL DEFAULT 20, max_hp INT NOT NULL DEFAULT 20, ability TEXT, moves JSONB DEFAULT '[]'::jsonb);`);
   
+  // Unique canonical moves table (one row per effects/bonuses combination)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mg_moves (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      stack TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+      bonuses TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  // keep name unique per exact stack/bonuses combo via functional index on canonical key
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS mg_moves_canonical_uniq
+      ON mg_moves (
+        md5(
+          COALESCE(array_to_string(stack, '│'), '') || '§' ||
+          COALESCE(array_to_string(bonuses, '│'), '')
+        )
+      );
+  `);
+
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS growth JSONB`);
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS slot INT`);
   await pool.query(`
@@ -746,15 +811,17 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     const newStack   = result.stack;
     const newBonuses = result.bonuses;
 
-    // Recompute MAX PP from base effect
+    // Recompute MAX PP from base effect (from CSV; fallback to prior or 20)
     const prior = moves[idx] || {};
     const newPP = computePPFromBaseEffect(newStack, (prior.pp|0) || 20);
 
-    // Merge into move object
-    moves[idx] = { ...prior, stack:newStack, bonuses:newBonuses, pp:newPP };
+    // --- Ensure DB-stored move name for this exact combo
+    const ensuredName = await ensureMoveRecord(newStack, newBonuses);
+
+    // Merge into move object (overwrite name with canonical)
+    moves[idx] = { ...prior, name: ensuredName, stack:newStack, bonuses:newBonuses, pp:newPP };
 
     // Clamp CURRENT PP (do not refill here; refill happens on heal)
-    // Load current_pp to clamp only this move by name
     const { rows: curRows } = await pool.query(
       `SELECT current_pp FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
       [monId, req.session.player_id]
@@ -887,10 +954,16 @@ app.get('/api/content/bonuses', auth, (req, res) => {
   return res.json({ bonuses: c?.bonuses || [], version: c?.version || 0 });
 });
 
-app.get('/api/content/moves_named', auth, (req, res) => {
+app.get('/api/content/abilities', auth, (req, res) => {
   const c = OVERRIDE_CONTENT || getContent();
-  return res.json({ moves: c?.named_moves || [], version: c?.version || 0 });
+  return res.json({ abilities: c?.abilities || [], version: c?.version || 0 });
 });
+
+app.get('/api/content/moves', auth, (req, res) => {
+  const c = OVERRIDE_CONTENT || getContent();
+  return res.json({ moves: c?.moves || [], version: c?.version || 0 });
+});
+
 
 // Optional: quick admin-only reload (temporary guard: player_id === 1)
 app.post('/api/admin/content/reload', auth, (req, res) => {
@@ -911,25 +984,25 @@ app.post('/api/admin/content/import', auth, async (req,res)=>{
     const join = (p)=> base.endsWith('/') ? base + p : base + '/' + p;
 
     // 1) Fetch CSV files as text
-    const [speciesTxt, effectsTxt, bonusesTxt, movesTxt] = await Promise.all([
+    const [speciesTxt, effectsTxt, bonusesTxt, abilitiesTxt, movesTxt] = await Promise.all([
       httpGetText(join('species.csv')),
       httpGetText(join('effects.csv')),
       httpGetText(join('bonuses.csv')),
-      httpGetText(join('moves_named.csv')),
+      httpGetText(join('abilities.csv')),
+      httpGetText(join('moves.csv')),
     ]);
 
     // 2) Parse
-    const speciesRows = parseCSV(speciesTxt);   // expects headers listed in the table I gave you earlier
-    const effectsRows = parseCSV(effectsTxt);   // expects at least: code; optional: accuracy, base_pp, base/base_flag_eligible/etc.
-    const bonusesRows = parseCSV(bonusesTxt);   // expects at least: code
-    const namedRows   = parseCSV(movesTxt);     // free-form: we store the rows verbatim for the client to display
+    const speciesRows = parseCSV(speciesTxt);
+    const effectsRows = parseCSV(effectsTxt);
+    const bonusesRows = parseCSV(bonusesTxt);
+    const abilitiesRows = parseCSV(abilitiesTxt);
+    const movesRows = parseCSV(movesTxt);
 
-    // 3) Upsert species into DB
-    // Required columns with defaults if missing
+    // 3) Upsert species into DB (same as before)
     const ensure = (o,k,def)=> (o[k]==null || String(o[k]).trim()==='') ? (o[k]=def) : o[k];
     await pool.query('BEGIN');
     for (const r of speciesRows){
-      // normalize
       const id               = intOr(0, r.id);
       const name             = String(r.name||'').trim();
       const base_spawn_rate  = numOr(0.05, r.base_spawn_rate);
@@ -956,8 +1029,7 @@ app.post('/api/admin/content/import', auth, async (req,res)=>{
     }
     await pool.query('COMMIT');
 
-    // 4) Build in-memory content override from effects/bonuses/moves
-    //    We keep all original columns, but ensure critical ones exist.
+    // 4) Build in-memory content override from effects/bonuses/abilities/moves
     const normEffects = effectsRows.map(row=>{
       const code = String(row.code||'').trim();
       return {
@@ -965,7 +1037,6 @@ app.post('/api/admin/content/import', auth, async (req,res)=>{
         code,
         accuracy: (row.accuracy!==undefined && row.accuracy!=='') ? Number(row.accuracy) : undefined,
         base_pp:  (row.base_pp!==undefined  && row.base_pp!=='')  ? Number(row.base_pp)  : undefined,
-        // allow any of these to signal "base effect" eligibility
         base_flag_eligible: (row.base_flag_eligible!==undefined ? row.base_flag_eligible : row.base),
         base: row.base
       };
@@ -976,7 +1047,22 @@ app.post('/api/admin/content/import', auth, async (req,res)=>{
       return { ...row, code };
     }).filter(r=>r.code);
 
-    const normNamed = namedRows; // keep as-is for the editor
+    const normAbilities = abilitiesRows.map(row=>{
+      const code = String(row.code||'').trim();
+      const name = String(row.name||'').trim();
+      const field_effect = String(row.field_effect||'').trim();
+      const stack_effects = toTextArrayCell(row.stack_effects);
+      const stack_bonuses = toTextArrayCell(row.stack_bonuses);
+      return { ...row, code, name, field_effect, stack_effects, stack_bonuses };
+    }).filter(r=>r.code);
+
+    const normMoves = movesRows.map(row=>{
+      // every row is a stack recipe; name may be empty (we can still carry it for editors)
+      const name = String(row.name||'').trim();
+      const stack_effects = toTextArrayCell(row.stack_effects);
+      const stack_bonuses = toTextArrayCell(row.stack_bonuses);
+      return { ...row, name, stack_effects, stack_bonuses };
+    });
 
     const poolEffects = normEffects.map(e=>e.code);
     const poolBonuses = normBonuses.map(b=>b.code);
@@ -984,7 +1070,8 @@ app.post('/api/admin/content/import', auth, async (req,res)=>{
     OVERRIDE_CONTENT = {
       effects: normEffects,
       bonuses: normBonuses,
-      named_moves: normNamed,
+      abilities: normAbilities,
+      moves: normMoves,              // edited/testing list (not the DB registry)
       pool: { effects: poolEffects, bonuses: poolBonuses },
       version: Date.now()
     };
@@ -993,7 +1080,8 @@ app.post('/api/admin/content/import', auth, async (req,res)=>{
       species: speciesRows.length,
       effects: normEffects.length,
       bonuses: normBonuses.length,
-      moves_named: normNamed.length
+      abilities: normAbilities.length,
+      moves: normMoves.length
     }});
   }catch(e){
     try{ await pool.query('ROLLBACK'); }catch(_){}
