@@ -186,12 +186,12 @@ async function ensureMoveRecord(stack, bonuses){
     `
     SELECT name
       FROM mg_moves
-     WHERE md5(COALESCE(array_to_string(stack,'│'),'') || '§' || COALESCE(array_to_string(bonuses,'│'),''))
-           = md5($1 || '§' || $2)
+     WHERE stack = $1::text[] AND bonuses = $2::text[]
      LIMIT 1
     `,
-    [ s.join('│'), bon.join('│') ]
+    [ s, bon ]
   );
+
   if (found.length) return String(found[0].name || '');
 
   // insert new
@@ -326,16 +326,13 @@ async function initDB(){
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
-  // keep name unique per exact stack/bonuses combo via functional index on canonical key
+  
+  // keep name unique per exact stack/bonuses combo using a simple unique index
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS mg_moves_canonical_uniq
-      ON mg_moves (
-        md5(
-          COALESCE(array_to_string(stack, '│'), '') || '§' ||
-          COALESCE(array_to_string(bonuses, '│'), '')
-        )
-      );
+    CREATE UNIQUE INDEX IF NOT EXISTS mg_moves_stack_bonuses_uniq
+      ON mg_moves (stack, bonuses);
   `);
+
 
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS growth JSONB`);
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS slot INT`);
