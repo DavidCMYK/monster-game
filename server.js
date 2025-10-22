@@ -10,12 +10,6 @@ const { Pool } = require('pg');
 const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
-// --- helpers used by /api/admin/content/import ---
-
-function getContent() {
-  return global.__MG_CONTENT || null;
-}
-
 
 // --- Learn-pool helpers ---
 function extractTraitsFromMoves(moves){
@@ -79,7 +73,7 @@ async function incrementLearnPoolForMonster(monsterId, effects, bonuses){
 
 // --- Stack validation helpers (effects/bonuses) ---
 function _contentIndex(){
-  const c = getContent() || {};
+  const c = (OVERRIDE_CONTENT || getContent() || {});
   const effects = Array.isArray(c.effects) ? c.effects : [];
   const bonuses = Array.isArray(c.bonuses) ? c.bonuses : [];
 
@@ -157,7 +151,7 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
 
 // --- Per-effect resolver helpers (accuracy & PP from base effect) ---
 function getEffectRowByCode(code){
-  const c = getContent() || {};
+  const c = (OVERRIDE_CONTENT || getContent() || {});
   const list = Array.isArray(c.effects) ? c.effects : [];
   const k = String(code || '').trim();
   return list.find(e => String(e.code || '').trim() === k) || null;
@@ -1122,16 +1116,19 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
     };
 
     // If you have a setter in contentLoader, use it; else store on a module var.
-    try {
+    //try {
       // Prefer: contentLoader.setContent(content)
-      if (typeof global.__MG_CONTENT === 'object') {
-        global.__MG_CONTENT = content;
-      } else {
-        global.__MG_CONTENT = content;
-      }
-    } catch(_) {
-      global.__MG_CONTENT = content;
-    }
+    //  if (typeof global.__MG_CONTENT === 'object') {
+    //    global.__MG_CONTENT = content;
+    //  } else {
+    //    global.__MG_CONTENT = content;
+    //  }
+    //} catch(_) {
+    //  global.__MG_CONTENT = content;
+    //}
+    
+    // Publish imported content immediately in-process
+    OVERRIDE_CONTENT = content;
 
     // Respond with counts
     return res.json({
