@@ -276,6 +276,54 @@ const pool = new Pool({
 
 const CHUNK_W = 256, CHUNK_H = 256;
 
+// --- Content Tables (DB) ----------------------------------------------------
+// We’ll store effects/bonuses/moves_named/abilities directly in Postgres.
+// This helper creates tables if they don’t exist. Call it on boot.
+async function ensureContentTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mg_effects (
+      id SERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      target TEXT DEFAULT 'target',              -- 'self' | 'target'
+      accuracy_base NUMERIC(5,2) DEFAULT 1.00,   -- 0..1
+      cost INT DEFAULT 0,
+      duration TEXT DEFAULT '',                  -- '' | '-1' | 'N' (string form to keep it simple)
+      base_flag_eligible BOOLEAN DEFAULT FALSE,  -- eligible to be a base effect
+      base_pp INT DEFAULT 20,
+      tick_source TEXT DEFAULT NULL,             -- e.g. 'PHY' | 'MAG'
+      tick_percent NUMERIC(5,2) DEFAULT NULL,    -- e.g. 10.00 = 10%
+      notes TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS mg_bonuses (
+      id SERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      target_metric TEXT DEFAULT '',     -- e.g. 'damage','accuracy','pp','element:Fire'
+      value_type TEXT DEFAULT 'flat',    -- 'flat' | 'percent' | 'tag'
+      value NUMERIC(8,2) DEFAULT 0,      -- number when flat/percent; ignored if tag
+      cost INT DEFAULT 0,
+      notes TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS mg_moves_named (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      stack_effects JSONB DEFAULT '[]',  -- ["EFFECT_CODE", ...]
+      stack_bonuses JSONB DEFAULT '[]',  -- ["BONUS_CODE", ...]
+      notes TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS mg_abilities (
+      id SERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      notes TEXT DEFAULT ''
+    );
+  `);
+  console.log('[DB] Content tables ensured');
+}
+ensureContentTables().catch(e => console.error('ensureContentTables error:', e));
+
 // --- (optional) load content on startup ---
 // Disabled by default to avoid hitting remote CSV host during deploys.
 // To enable, set MG_PRELOAD_CONTENT=true in the environment.
@@ -1225,6 +1273,160 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
   }
 
 });
+
+/* -------- Admin: DB-backed Content CRUD (effects/bonuses/moves_named/abilities) -------- */
+// TEMP admin guard: only allow player_id === 1
+function adminGuard(req, res) {
+  if (!req.session || req.session.player_id !== 1) {
+    res.status(403).json({ error: 'forbidden' });
+    return false;
+  }
+  return true;
+}
+
+// Whitelist to avoid arbitrary table access
+const CONTENT_TABLES = {
+  effects:   { table: 'mg_effects',   pk: 'id' },
+  bonuses:   { table: 'mg_bonuses',   pk: 'id' },
+  moves:     { table: 'mg_moves_named', pk: 'id' },
+  abilities: { table: 'mg_abilities', pk: 'id' }
+};
+
+// GET list (with simple pagination later if needed)
+app.get('/api/admin/db/:kind', auth, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  const kind = String(req.params.kind || '').toLowerCase();
+  const meta = CONTENT_TABLES[kind];
+  if (!meta) return res.status(400).json({ error: 'bad_kind' });
+  try {
+    const { rows } = await pool.query(`SELECT * FROM ${meta.table} ORDER BY ${meta.pk} ASC`);
+    res.json({ ok:true, rows });
+  } catch (e) {
+    console.error('admin list error', e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// UPSERT (insert if no id; update if id is present)
+app.post('/api/admin/db/:kind', auth, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  const kind = String(req.params.kind || '').toLowerCase();
+  const meta = CONTENT_TABLES[kind];
+  if (!meta) return res.status(400).json({ error: 'bad_kind' });
+
+  const body = req.body || {};
+  try {
+    let q, params;
+    if (kind === 'effects') {
+      const {
+        id, code, name, description='',
+        target='target', accuracy_base=1.00, cost=0,
+        duration='', base_flag_eligible=false, base_pp=20,
+        tick_source=null, tick_percent=null, notes=''
+      } = body;
+      if (!code || !name) return res.status(400).json({ error:'missing_fields' });
+
+      if (id) {
+        q = `
+          UPDATE mg_effects SET
+            code=$1, name=$2, description=$3, target=$4, accuracy_base=$5, cost=$6,
+            duration=$7, base_flag_eligible=$8, base_pp=$9, tick_source=$10, tick_percent=$11, notes=$12
+          WHERE id=$13
+          RETURNING *`;
+        params = [code, name, description, target, accuracy_base, cost,
+                  duration, base_flag_eligible, base_pp, tick_source, tick_percent, notes, id];
+      } else {
+        q = `
+          INSERT INTO mg_effects (code,name,description,target,accuracy_base,cost,duration,base_flag_eligible,base_pp,tick_source,tick_percent,notes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          RETURNING *`;
+        params = [code, name, description, target, accuracy_base, cost,
+                  duration, base_flag_eligible, base_pp, tick_source, tick_percent, notes];
+      }
+    } else if (kind === 'bonuses') {
+      const {
+        id, code, name, target_metric='', value_type='flat', value=0, cost=0, notes=''
+      } = body;
+      if (!code || !name) return res.status(400).json({ error:'missing_fields' });
+      if (id) {
+        q = `
+          UPDATE mg_bonuses SET
+            code=$1, name=$2, target_metric=$3, value_type=$4, value=$5, cost=$6, notes=$7
+          WHERE id=$8
+          RETURNING *`;
+        params = [code, name, target_metric, value_type, value, cost, notes, id];
+      } else {
+        q = `
+          INSERT INTO mg_bonuses (code,name,target_metric,value_type,value,cost,notes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          RETURNING *`;
+        params = [code, name, target_metric, value_type, value, cost, notes];
+      }
+    } else if (kind === 'moves') {
+      const { id, name, stack_effects=[], stack_bonuses=[], notes='' } = body;
+      if (!name) return res.status(400).json({ error:'missing_fields' });
+      const eff = Array.isArray(stack_effects) ? stack_effects : [];
+      const bon = Array.isArray(stack_bonuses) ? stack_bonuses : [];
+      if (id) {
+        q = `
+          UPDATE mg_moves_named SET
+            name=$1, stack_effects=$2::jsonb, stack_bonuses=$3::jsonb, notes=$4
+          WHERE id=$5
+          RETURNING *`;
+        params = [name, JSON.stringify(eff), JSON.stringify(bon), notes, id];
+      } else {
+        q = `
+          INSERT INTO mg_moves_named (name,stack_effects,stack_bonuses,notes)
+          VALUES ($1,$2::jsonb,$3::jsonb,$4)
+          RETURNING *`;
+        params = [name, JSON.stringify(eff), JSON.stringify(bon), notes];
+      }
+    } else if (kind === 'abilities') {
+      const { id, code, name, notes='' } = body;
+      if (!code || !name) return res.status(400).json({ error:'missing_fields' });
+      if (id) {
+        q = `
+          UPDATE mg_abilities SET
+            code=$1, name=$2, notes=$3
+          WHERE id=$4
+          RETURNING *`;
+        params = [code, name, notes, id];
+      } else {
+        q = `
+          INSERT INTO mg_abilities (code,name,notes)
+          VALUES ($1,$2,$3)
+          RETURNING *`;
+        params = [code, name, notes];
+      }
+    } else {
+      return res.status(400).json({ error:'bad_kind' });
+    }
+
+    const { rows } = await pool.query(q, params);
+    return res.json({ ok:true, row: rows[0] });
+  } catch (e) {
+    console.error('admin upsert error', e);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+// DELETE by id
+app.delete('/api/admin/db/:kind/:id', auth, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  const kind = String(req.params.kind || '').toLowerCase();
+  const meta = CONTENT_TABLES[kind];
+  if (!meta) return res.status(400).json({ error: 'bad_kind' });
+  const id = Number(req.params.id || 0);
+  if (!id) return res.status(400).json({ error: 'bad_id' });
+  try {
+    await pool.query(`DELETE FROM ${meta.table} WHERE ${meta.pk}=$1`, [id]);
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error('admin delete error', e);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
 
 // helper to get a chunk from `world` in whatever shape the module exposes
 function getWorldChunk(cx, cy){
