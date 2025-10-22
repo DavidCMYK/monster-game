@@ -10,6 +10,74 @@ const { Pool } = require('pg');
 const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
+// --- helpers used by /api/admin/content/import ---
+const https = require('https');
+
+function httpGetText(url){
+  return new Promise((resolve, reject)=>{
+    const mod = url.startsWith('https:') ? https : http;
+    const req = mod.get(url, res=>{
+      if (res.statusCode < 200 || res.statusCode >= 300){
+        return reject(new Error(`GET ${url} -> ${res.statusCode}`));
+      }
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk=> data += chunk);
+      res.on('end', ()=> resolve(data));
+    });
+    req.on('error', reject);
+  });
+}
+
+// Minimal CSV parser that handles quoted fields and commas
+function parseCSV(text){
+  if (!text || !text.trim()) return [];
+  const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(l=>l.trim().length>0);
+  if (lines.length === 0) return [];
+  const header = splitCSVLine(lines[0]);
+  const rows = [];
+  for (let i=1;i<lines.length;i++){
+    const cols = splitCSVLine(lines[i]);
+    const obj = {};
+    for (let c=0;c<header.length;c++){
+      obj[header[c]] = cols[c] ?? '';
+    }
+    rows.push(obj);
+  }
+  return rows;
+}
+function splitCSVLine(line){
+  const out = [];
+  let cur = '';
+  let inQ = false;
+  for (let i=0;i<line.length;i++){
+    const ch = line[i];
+    if (inQ){
+      if (ch === '"' && line[i+1] === '"'){ cur += '"'; i++; continue; }
+      if (ch === '"'){ inQ = false; continue; }
+      cur += ch;
+    }else{
+      if (ch === '"'){ inQ = true; continue; }
+      if (ch === ','){ out.push(cur); cur=''; continue; }
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// number helpers
+function intOr(def, v){ const n = parseInt(v,10); return Number.isFinite(n) ? n : def; }
+function numOr(def, v){ const n = Number(v); return Number.isFinite(n) ? n : def; }
+
+// Parse a pipe-separated cell into a TEXT[] (e.g., "a|b|c" -> ["a","b","c"])
+function toTextArrayCell(val){
+  if (val == null) return [];
+  const s = String(val).trim();
+  if (!s) return [];
+  return s.split('|').map(x=>x.trim()).filter(Boolean);
+}
+
 // --- Learn-pool helpers ---
 function extractTraitsFromMoves(moves){
   const seenEffects = new Set();
