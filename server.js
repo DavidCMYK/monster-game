@@ -353,6 +353,61 @@ async function createPlayer(email, handle, password){
   return player_id;
 }
 
+// -------- CSV import helpers + content override --------
+const https = require('https');
+let OVERRIDE_CONTENT = null; // { effects:[], bonuses:[], named_moves:[], pool:{effects:[],bonuses:[]}, version:number }
+
+function httpGetText(url){
+  return new Promise((resolve,reject)=>{
+    https.get(url, res=>{
+      if (res.statusCode && res.statusCode >= 400) return reject(new Error('HTTP '+res.statusCode));
+      let data=''; res.setEncoding('utf8');
+      res.on('data', chunk=> data+=chunk);
+      res.on('end', ()=> resolve(data));
+    }).on('error', reject);
+  });
+}
+
+// very small CSV parser: handles commas and double-quotes ("" -> ")
+function parseCSV(text){
+  const out = [];
+  let row=[], cur='', inQ=false, i=0;
+  while(i<text.length){
+    const c=text[i];
+    if (inQ){
+      if (c==='"' && text[i+1]==='"'){ cur+='"'; i+=2; continue; }
+      if (c==='"'){ inQ=false; i++; continue; }
+      cur+=c; i++; continue;
+    }
+    if (c==='"' ){ inQ=true; i++; continue; }
+    if (c===','){ row.push(cur); cur=''; i++; continue; }
+    if (c==='\r'){ i++; continue; }
+    if (c==='\n'){ row.push(cur); cur=''; out.push(row); row=[]; i++; continue; }
+    cur+=c; i++;
+  }
+  row.push(cur); out.push(row);
+  // header -> objects
+  const header = (out.shift()||[]).map(h=>String(h||'').trim());
+  return out.filter(r=>r.length && r.some(x=>String(x).trim().length)).map(r=>{
+    const o={}; for (let j=0;j<header.length;j++){ o[header[j]] = r[j]!=null ? r[j] : ''; }
+    return o;
+  });
+}
+
+// map helpers
+function toTextArrayCell(v){
+  // allow "a|b|c" OR JSON-like ["a","b"]
+  const s = String(v||'').trim();
+  if (!s) return [];
+  if (s.startsWith('[')) { try { const arr = JSON.parse(s); return Array.isArray(arr)?arr.map(String):[]; } catch { return []; } }
+  return s.split('|').map(x=>x.trim()).filter(Boolean);
+}
+
+function numOr(def, v){ const n=Number(v); return Number.isFinite(n)? n : def; }
+function intOr(def, v){ const n=parseInt(v,10); return Number.isFinite(n)? n : def; }
+function boolish(v){ const s=String(v||'').toLowerCase(); return (s==='1'||s==='true'||s==='yes'); }
+
+
 async function createSession(player_id){ const t = token(); await pool.query(`INSERT INTO mg_sessions (token,player_id) VALUES ($1,$2)`, [t,player_id]); return t; }
 async function getSession(tok){
   const { rows } = await pool.query(`SELECT s.token, p.id AS player_id, p.email, p.handle FROM mg_sessions s JOIN mg_players p ON p.id=s.player_id WHERE s.token=$1 LIMIT 1`, [tok]);
@@ -818,22 +873,22 @@ app.get('/api/species', async (_req,res)=>{
 
 /* ---------- content (effects/bonuses/moves) ---------- */
 app.get('/api/content/pool', auth, (req, res) => {
-  const c = getContent();
+  const c = OVERRIDE_CONTENT || getContent();
   return res.json(c?.pool || { effects:[], bonuses:[] });
 });
 
 app.get('/api/content/effects', auth, (req, res) => {
-  const c = getContent();
+  const c = OVERRIDE_CONTENT || getContent();
   return res.json({ effects: c?.effects || [], version: c?.version || 0 });
 });
 
 app.get('/api/content/bonuses', auth, (req, res) => {
-  const c = getContent();
+  const c = OVERRIDE_CONTENT || getContent();
   return res.json({ bonuses: c?.bonuses || [], version: c?.version || 0 });
 });
 
 app.get('/api/content/moves_named', auth, (req, res) => {
-  const c = getContent();
+  const c = OVERRIDE_CONTENT || getContent();
   return res.json({ moves: c?.named_moves || [], version: c?.version || 0 });
 });
 
@@ -843,6 +898,110 @@ app.post('/api/admin/content/reload', auth, (req, res) => {
   const c = reloadContent();
   return res.json({ ok:true, version: c?.version || 0 });
 });
+
+// Admin: import CSVs from a base URL (HTTPS). Requires player_id === 1 (same temporary guard)
+app.post('/api/admin/content/import', auth, async (req,res)=>{
+  if (req.session?.player_id !== 1) return res.status(403).json({ error:'forbidden' });
+
+  try{
+    const base = String(req.body?.base_url||'').trim();
+    if (!base || !(base.startsWith('https://') || base.startsWith('http://'))){
+      return res.status(400).json({ error:'bad_url', message:'Provide a full HTTP(S) base URL (e.g., https://example.com/content/).' });
+    }
+    const join = (p)=> base.endsWith('/') ? base + p : base + '/' + p;
+
+    // 1) Fetch CSV files as text
+    const [speciesTxt, effectsTxt, bonusesTxt, movesTxt] = await Promise.all([
+      httpGetText(join('species.csv')),
+      httpGetText(join('effects.csv')),
+      httpGetText(join('bonuses.csv')),
+      httpGetText(join('moves_named.csv')),
+    ]);
+
+    // 2) Parse
+    const speciesRows = parseCSV(speciesTxt);   // expects headers listed in the table I gave you earlier
+    const effectsRows = parseCSV(effectsTxt);   // expects at least: code; optional: accuracy, base_pp, base/base_flag_eligible/etc.
+    const bonusesRows = parseCSV(bonusesTxt);   // expects at least: code
+    const namedRows   = parseCSV(movesTxt);     // free-form: we store the rows verbatim for the client to display
+
+    // 3) Upsert species into DB
+    // Required columns with defaults if missing
+    const ensure = (o,k,def)=> (o[k]==null || String(o[k]).trim()==='') ? (o[k]=def) : o[k];
+    await pool.query('BEGIN');
+    for (const r of speciesRows){
+      // normalize
+      const id               = intOr(0, r.id);
+      const name             = String(r.name||'').trim();
+      const base_spawn_rate  = numOr(0.05, r.base_spawn_rate);
+      const biomes           = toTextArrayCell(r.biomes);
+      const types            = toTextArrayCell(r.types);
+      ensure(r,'base_hp',40); ensure(r,'base_phy',10); ensure(r,'base_mag',10);
+      ensure(r,'base_def',10); ensure(r,'base_res',10); ensure(r,'base_spd',10);
+      ensure(r,'base_acc',95); ensure(r,'base_eva',5);
+
+      if (!id || !name) continue;
+
+      await pool.query(`
+        INSERT INTO mg_species (id,name,base_spawn_rate,biomes,types,base_hp,base_phy,base_mag,base_def,base_res,base_spd,base_acc,base_eva)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (id) DO UPDATE SET
+          name=$2, base_spawn_rate=$3, biomes=$4, types=$5,
+          base_hp=$6, base_phy=$7, base_mag=$8, base_def=$9, base_res=$10, base_spd=$11, base_acc=$12, base_eva=$13
+      `, [
+        id, name, base_spawn_rate, biomes, types,
+        intOr(40, r.base_hp), intOr(10, r.base_phy), intOr(10, r.base_mag),
+        intOr(10, r.base_def), intOr(10, r.base_res), intOr(10, r.base_spd),
+        intOr(95, r.base_acc), intOr(5, r.base_eva)
+      ]);
+    }
+    await pool.query('COMMIT');
+
+    // 4) Build in-memory content override from effects/bonuses/moves
+    //    We keep all original columns, but ensure critical ones exist.
+    const normEffects = effectsRows.map(row=>{
+      const code = String(row.code||'').trim();
+      return {
+        ...row,
+        code,
+        accuracy: (row.accuracy!==undefined && row.accuracy!=='') ? Number(row.accuracy) : undefined,
+        base_pp:  (row.base_pp!==undefined  && row.base_pp!=='')  ? Number(row.base_pp)  : undefined,
+        // allow any of these to signal "base effect" eligibility
+        base_flag_eligible: (row.base_flag_eligible!==undefined ? row.base_flag_eligible : row.base),
+        base: row.base
+      };
+    }).filter(r=>r.code);
+
+    const normBonuses = bonusesRows.map(row=>{
+      const code = String(row.code||'').trim();
+      return { ...row, code };
+    }).filter(r=>r.code);
+
+    const normNamed = namedRows; // keep as-is for the editor
+
+    const poolEffects = normEffects.map(e=>e.code);
+    const poolBonuses = normBonuses.map(b=>b.code);
+
+    OVERRIDE_CONTENT = {
+      effects: normEffects,
+      bonuses: normBonuses,
+      named_moves: normNamed,
+      pool: { effects: poolEffects, bonuses: poolBonuses },
+      version: Date.now()
+    };
+
+    return res.json({ ok:true, imported:{
+      species: speciesRows.length,
+      effects: normEffects.length,
+      bonuses: normBonuses.length,
+      moves_named: normNamed.length
+    }});
+  }catch(e){
+    try{ await pool.query('ROLLBACK'); }catch(_){}
+    console.error('import error:', e);
+    return res.status(500).json({ error:'server_error', message:String(e.message||e) });
+  }
+});
+
 
 // helper to get a chunk from `world` in whatever shape the module exposes
 function getWorldChunk(cx, cy){
