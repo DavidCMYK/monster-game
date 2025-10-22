@@ -275,8 +275,14 @@ const pool = new Pool({
 });
 
 const CHUNK_W = 256, CHUNK_H = 256;
-// --- Load content from CSV files at startup ---
-try { reloadContent(); } catch(e){ console.error('Content load failed:', e.message); }
+
+// --- (optional) load content on startup ---
+// Disabled by default to avoid hitting remote CSV host during deploys.
+// To enable, set MG_PRELOAD_CONTENT=true in the environment.
+const PRELOAD = String(process.env.MG_PRELOAD_CONTENT || 'false').toLowerCase() === 'true';
+if (PRELOAD) {
+  try { reloadContent(); } catch(e){ console.error('Content load failed:', e.message); }
+}
 
 
 /* ---------- DB setup ---------- */
@@ -991,7 +997,7 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
 
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  async function getTextWithRetry(url, tries = 5, baseDelayMs = 400){
+  async function getTextWithRetry(url, tries = 7, baseDelayMs = 800){
     const isHttps = /^https:/i.test(url);
     const mod = isHttps ? https : http;
 
@@ -1084,13 +1090,13 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
     // 1) Fetch CSVs (sequentially to avoid rate limits)
     const speciesCSV  = await getTextWithRetry(`${BASE}/species.csv`);
     // tiny pause between calls to be extra polite
-    await sleep(200);
+    await sleep(1200);
     const effectsCSV  = await getTextWithRetry(`${BASE}/effects.csv`);
-    await sleep(200);
+    await sleep(1200);
     const bonusesCSV  = await getTextWithRetry(`${BASE}/bonuses.csv`);
-    await sleep(200);
+    await sleep(1200);
     const abilitiesCSV= await getTextWithRetry(`${BASE}/abilities.csv`);
-    await sleep(200);
+    await sleep(1200);
     const movesCSV    = await getTextWithRetry(`${BASE}/moves.csv`);
 
 
