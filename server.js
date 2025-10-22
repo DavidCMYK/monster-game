@@ -985,21 +985,81 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
   // Prefer body.base_url, then env, then default
   const BASE = (req.body?.base_url || process.env.MG_CONTENT_BASE_URL || 'https://davidchurchermuria.com/games/monster-game/content').replace(/\/+$/,'');
 
-  // Helper: small https GET that returns whole body
+  // Robust GET with polite headers, Retry-After support, and exponential backoff
   const https = require('https');
-  function getText(url){
-    return new Promise((resolve, reject) => {
-      https.get(url, (r) => {
-        if (r.statusCode && r.statusCode >= 400) {
-          return reject(new Error(`HTTP ${r.statusCode} for ${url}`));
+  const http  = require('http');
+
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  async function getTextWithRetry(url, tries = 5, baseDelayMs = 400){
+    const isHttps = /^https:/i.test(url);
+    const mod = isHttps ? https : http;
+
+    for (let attempt = 1; attempt <= tries; attempt++){
+      const { body, statusCode, retryAfter } = await new Promise((resolve) => {
+        const req = mod.request(
+          url,
+          {
+            method: 'GET',
+            headers: {
+              // Some hosts rate-limit generic bots; send a polite UA and avoid compression
+              'User-Agent': 'MonsterGameContentImporter/1.0 (+contact: admin@yourdomain.tld)',
+              'Accept': 'text/csv, text/plain, */*',
+              'Accept-Encoding': 'identity',
+              'Connection': 'close'
+            },
+            timeout: 15000
+          },
+          (res) => {
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+              const ra = res.headers && (res.headers['retry-after'] || res.headers['Retry-After']);
+              resolve({ body: data, statusCode: res.statusCode || 0, retryAfter: ra });
+            });
+          }
+        );
+        req.on('timeout', () => { req.destroy(new Error(`Timeout for ${url}`)); });
+        req.on('error', (err) => {
+          // Bubble the error up as a synthetic response so we can apply retries
+          resolve({ body: String(err && err.message || err), statusCode: 599, retryAfter: null });
+        });
+        req.end();
+      });
+
+      // Success (2xx)
+      if (statusCode >= 200 && statusCode < 300) return body;
+
+      // If 429 or 503, respect Retry-After or exponential backoff
+      if (statusCode === 429 || statusCode === 503){
+        let waitMs = baseDelayMs * Math.pow(2, attempt - 1);
+        if (retryAfter){
+          const secs = Number(retryAfter);
+          if (!Number.isNaN(secs) && secs > 0){
+            waitMs = Math.max(waitMs, secs * 1000);
+          }
         }
-        let data = '';
-        r.setEncoding('utf8');
-        r.on('data', chunk => data += chunk);
-        r.on('end', () => resolve(data));
-      }).on('error', reject);
-    });
+        // jitter ±25%
+        const jitter = Math.floor(waitMs * (Math.random()*0.5 - 0.25));
+        await sleep(waitMs + jitter);
+        continue;
+      }
+
+      // For other non-2xx, only retry on the first 1–2 attempts
+      if (attempt < Math.min(3, tries)){
+        const waitMs = baseDelayMs * Math.pow(2, attempt - 1);
+        await sleep(waitMs);
+        continue;
+      }
+
+      // Give up with a clear error
+      throw new Error(`HTTP ${statusCode} for ${url}`);
+    }
+
+    throw new Error(`Failed to fetch after ${tries} attempts: ${url}`);
   }
+
 
   // Tiny CSV parser: header row + simple comma split (works for our seed files)
   function parseCSV(text){
@@ -1021,14 +1081,18 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
   }
 
   try {
-    // 1) Fetch CSVs
-    const [speciesCSV, effectsCSV, bonusesCSV, abilitiesCSV, movesCSV] = await Promise.all([
-      getText(`${BASE}/species.csv`),
-      getText(`${BASE}/effects.csv`),
-      getText(`${BASE}/bonuses.csv`),
-      getText(`${BASE}/abilities.csv`),
-      getText(`${BASE}/moves.csv`),
-    ]);
+    // 1) Fetch CSVs (sequentially to avoid rate limits)
+    const speciesCSV  = await getTextWithRetry(`${BASE}/species.csv`);
+    // tiny pause between calls to be extra polite
+    await sleep(200);
+    const effectsCSV  = await getTextWithRetry(`${BASE}/effects.csv`);
+    await sleep(200);
+    const bonusesCSV  = await getTextWithRetry(`${BASE}/bonuses.csv`);
+    await sleep(200);
+    const abilitiesCSV= await getTextWithRetry(`${BASE}/abilities.csv`);
+    await sleep(200);
+    const movesCSV    = await getTextWithRetry(`${BASE}/moves.csv`);
+
 
     // 2) Parse
     const speciesRows   = parseCSV(speciesCSV);
