@@ -359,6 +359,47 @@ async function ensureContentTables() {
   console.log('[DB] Content tables ensured/updated');
 }
 ensureContentTables().catch(e => console.error('ensureContentTables error:', e));
+// --- Move naming & persistence ---------------------------------------------
+function normalizeMoveParts(stack, bonuses){
+  // Keep base effect first; sort the rest for stable matching; de-dup
+  const s = Array.isArray(stack) ? stack.map(x=>String(x||'').trim()).filter(Boolean) : [];
+  const b = Array.isArray(bonuses) ? bonuses.map(x=>String(x||'').trim()).filter(Boolean) : [];
+  const base = s[0] || '';
+  const rest = s.slice(1).filter(x=>x!==base).sort();
+  const sb = Array.from(new Set([base, ...rest]));           // effects
+  const bb = Array.from(new Set(b.sort()));                  // bonuses
+  return { stack: sb, bonuses: bb };
+}
+
+// If a stack exists in mg_moves_named, use its name; otherwise create it.
+// Returns { name, stack, bonuses, id }
+async function resolveMoveNameAndPersist(stack, bonuses){
+  const n = normalizeMoveParts(stack, bonuses);
+
+  // Try exact match first
+  const sel = await pool.query(
+    `SELECT id, name FROM mg_moves_named
+      WHERE stack_effects = $1::jsonb AND stack_bonuses = $2::jsonb
+      LIMIT 1`,
+    [JSON.stringify(n.stack), JSON.stringify(n.bonuses)]
+  );
+  if (sel.rows.length){
+    return { id: sel.rows[0].id, name: sel.rows[0].name, stack: n.stack, bonuses: n.bonuses };
+  }
+
+  // Build a basic concatenated name from codes
+  const builtName = [...n.stack, ...n.bonuses].join(' + ') || 'Unnamed';
+
+  // Insert new named move so the same stack reuses this name next time
+  const ins = await pool.query(
+    `INSERT INTO mg_moves_named (name, stack_effects, stack_bonuses)
+     VALUES ($1, $2::jsonb, $3::jsonb)
+     RETURNING id, name`,
+    [builtName, JSON.stringify(n.stack), JSON.stringify(n.bonuses)]
+  );
+
+  return { id: ins.rows[0].id, name: ins.rows[0].name, stack: n.stack, bonuses: n.bonuses };
+}
 
 // --- (optional) load content on startup ---
 // Disabled by default to avoid hitting remote CSV host during deploys.
@@ -1709,67 +1750,134 @@ function makePPMap(moves){
 }
 
 async function buildEnemyFromTile(tile){
-  // pick a random species weighted by base_spawn_rate
-  const { rows } = await pool.query(`SELECT id,name,base_spawn_rate FROM mg_species ORDER BY id ASC`);
-  if (!rows.length){
+  // 1) Pick a species weighted by base_spawn_rate
+  const { rows: speciesRows } = await pool.query(`SELECT id,name,base_spawn_rate FROM mg_species ORDER BY id ASC`);
+  if (!speciesRows.length){
+    // fallback if DB is empty
+    const fallbackMove = await resolveMoveNameAndPersist(['dmg_phys'], []);
     return {
       speciesId: 1, name: 'Fieldling', level: 3,
       hp: 20, max_hp: 20,
-      moves: [{ name:'Strike', base:'physical', power:8, accuracy:0.95, pp:25, stack:['dmg_phys'], bonuses:[] }]
+      moves: [{ name:fallbackMove.name, base:'physical', power:8, accuracy:0.95, pp:25, stack:fallbackMove.stack, bonuses:fallbackMove.bonuses }]
     };
   }
+  const weights = speciesRows.map(r => Math.max(0.01, Number(r.base_spawn_rate)||0.05));
+  const total   = weights.reduce((a,b)=>a+b,0);
+  let t = Math.random()*total, pick = speciesRows[0];
+  for (let i=0;i<weights.length;i++){ if ((t -= weights[i]) <= 0){ pick = speciesRows[i]; break; } }
 
-  const w = rows.map(r=>Math.max(0.01, Number(r.base_spawn_rate)||0.05));
-  const sum = w.reduce((a,b)=>a+b,0);
-  let t=Math.random()*sum, pick=rows[0];
-  for(let i=0;i<w.length;i++){ if ((t-=w[i])<=0){ pick = rows[i]; break; } }
-
+  // 2) Level: keep your existing 2..4 logic
   const level = 2 + Math.floor(Math.random()*3);
-  const hp = 16 + level*4;
 
-  // --- Build a tiny stacked move from content (base + maybe 1 extra effect + maybe 1 bonus)
-  const c = getContent() || {};
-  const effects = Array.isArray(c.effects) ? c.effects : [];
-  const bonuses = Array.isArray(c.bonuses) ? c.bonuses : [];
-  const baseEligible = effects.filter(e=>{
-    const v = String(e.base_flag_eligible ?? e.base ?? e.is_base ?? '').toLowerCase();
-    return v==='1' || v==='true' || v==='yes';
-  }).map(e=>String(e.code||'').trim()).filter(Boolean);
+  // 3) Pull species row and derive HP using your curve
+  const srow    = await getSpeciesRow(pick.id);
+  const neutral = { HP:1, PHY:1, MAG:1, DEF:1, RES:1, SPD:1, ACC:1, EVA:1 };
+  const derived = srow ? deriveStats(srow, neutral, level) : { HP: 16 + level*4 };
+  const hp = Math.max(1, derived.HP|0);
 
-  // Fallbacks if content is empty
-  const base = baseEligible[0] || 'dmg_phys';
+  // 4) Load effect/bonus pools from DB
+  const { rows: baseEffRows } = await pool.query(`
+    SELECT code, COALESCE(base_pp, 25) AS base_pp
+      FROM mg_effects
+     WHERE COALESCE(base_flag_eligible, false) = true
+  `);
+  const baseEligible = baseEffRows.map(r => String(r.code||'').trim()).filter(Boolean);
+  const basePPMap = Object.fromEntries(baseEffRows.map(r => [String(r.code||'').trim(), Number(r.base_pp)||25]));
 
-  // 50% chance add an extra non-base effect if available
-  const extraEffects = effects.map(e=>String(e.code||'').trim())
-    .filter(code => code && code !== base);
-  const maybeExtra = (extraEffects.length>0 && Math.random()<0.5) ? [ extraEffects[Math.floor(Math.random()*extraEffects.length)] ] : [];
+  const { rows: nonBaseEffRows } = await pool.query(`SELECT code FROM mg_effects WHERE COALESCE(base_flag_eligible, false) = false`);
+  const nonBaseEffects = nonBaseEffRows.map(r => String(r.code||'').trim()).filter(Boolean);
 
-  // 50% chance add a bonus
-  const bonusCodes = bonuses.map(b=>String(b.code||'').trim()).filter(Boolean);
-  const maybeBonus = (bonusCodes.length>0 && Math.random()<0.5) ? [ bonusCodes[Math.floor(Math.random()*bonusCodes.length)] ] : [];
+  const { rows: bonusRows } = await pool.query(`SELECT code FROM mg_bonuses`);
+  const bonusCodes = bonusRows.map(r => String(r.code||'').trim()).filter(Boolean);
 
-  // Validate & sanitize via the helper we added earlier
-  const v = validateAndSanitizeStack([base, ...maybeExtra], maybeBonus);
-  const stack = v.ok ? v.stack : [base];
-  const bonz  = v.ok ? v.bonuses : [];
-
-  // Compute PP from base effect (CSV), keep simple power/accuracy for now
-  const pp = computePPFromBaseEffect(stack, 25);
-  const wildMove = {
-    name: 'Strike',
-    base: (stack[0]==='dmg_spec' ? 'special' : (stack[0]==='buff_def' ? 'status' : 'physical')),
-    power: 8, accuracy: 0.95, pp,
-    stack, bonuses: bonz
+  // helpers
+  const pickOne = (arr)=> arr[Math.floor(Math.random()*arr.length)];
+  const baseToKind = (code)=>{
+    const c = String(code||'').toLowerCase();
+    if (c === 'dmg_spec') return 'special';
+    if (c.startsWith('buff_') || c.startsWith('debuff_') || c.startsWith('status_')) return 'status';
+    return 'physical';
   };
 
+  // 5) First move → 1 base-eligible effect
+  const firstBase = baseEligible.length ? pickOne(baseEligible) : 'dmg_phys';
+  const firstPP   = basePPMap[firstBase] || 25;
+  const firstNamed = await resolveMoveNameAndPersist([firstBase], []); // names & persists if new
+
+  const moves = [{
+    name: firstNamed.name,
+    base: baseToKind(firstBase),
+    power: 8,
+    accuracy: 0.95,
+    pp: firstPP,
+    stack: firstNamed.stack.slice(),
+    bonuses: firstNamed.bonuses.slice()
+  }];
+
+  // 6) For each level above 1: 20% new move, else add one effect/bonus and re-name
+  const extraSteps = Math.max(0, (level|0) - 1);
+  for (let i=0; i<extraSteps; i++){
+    const doNewMove = Math.random() < 0.20 && moves.length < 4;
+
+    if (doNewMove && baseEligible.length){
+      const base = pickOne(baseEligible);
+      const pp   = basePPMap[base] || 25;
+      const named = await resolveMoveNameAndPersist([base], []);
+      moves.push({
+        name: named.name,
+        base: baseToKind(base),
+        power: 8,
+        accuracy: 0.95,
+        pp,
+        stack: named.stack.slice(),
+        bonuses: named.bonuses.slice()
+      });
+      continue;
+    }
+
+    // Otherwise, add one non-base effect OR one bonus to an existing move, then re-name
+    const target = moves[Math.floor(Math.random()*moves.length)];
+    const tryEffect = Math.random() < 0.5;
+
+    // Work on normalized copies so we can re-name
+    let curStack = Array.isArray(target.stack) ? target.stack.slice() : [];
+    let curBons  = Array.isArray(target.bonuses) ? target.bonuses.slice() : [];
+
+    if (tryEffect && nonBaseEffects.length){
+      const pool = nonBaseEffects.filter(e => e && !curStack.includes(e));
+      if (pool.length){
+        curStack.push(pickOne(pool));
+      } else if (bonusCodes.length){
+        const bonusPool = bonusCodes.filter(b => b && !curBons.includes(b));
+        if (bonusPool.length) curBons.push(pickOne(bonusPool));
+      }
+    } else if (bonusCodes.length){
+      const bonusPool = bonusCodes.filter(b => b && !curBons.includes(b));
+      if (bonusPool.length){
+        curBons.push(pickOne(bonusPool));
+      } else if (nonBaseEffects.length){
+        const pool = nonBaseEffects.filter(e => e && !curStack.includes(e));
+        if (pool.length) curStack.push(pickOne(pool));
+      }
+    }
+
+    // Re-name (and persist if new) after the change
+    const renamed = await resolveMoveNameAndPersist(curStack, curBons);
+    target.name    = renamed.name;
+    target.stack   = renamed.stack.slice();
+    target.bonuses = renamed.bonuses.slice();
+    // (PP stays based on the base effect chosen when the move was first created.)
+  }
 
   return {
-    speciesId: pick.id, name: pick.name, level,
-    hp, max_hp: hp,
-    moves: [ wildMove ]
+    speciesId: pick.id,
+    name: pick.name,
+    level,
+    hp,
+    max_hp: hp,
+    moves
   };
 }
-
 
 app.post('/api/battle/start', auth, async (req,res)=>{
   try{
