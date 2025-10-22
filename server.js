@@ -210,6 +210,49 @@ async function getMoveDetailsById(moveId){
   return { id: rows[0].id|0, name: String(rows[0].name||''), stack: rows[0].stack||[], bonuses: rows[0].bonuses||[] };
 }
 
+async function attachPPToMoves(mon){
+  try{
+    if (!mon || !Array.isArray(mon.moves)) return mon;
+    // Try to pull any legacy name->pp map (may be null; that's fine)
+    let namePPMap = {};
+    try{ namePPMap = await getCurrentPP(mon) || {}; }catch(_){ namePPMap = {}; }
+
+    const out = [];
+    for (const mv of (mon.moves||[]).slice(0,4)){
+      const m = mv ? { ...mv } : {};
+      const displayName = (m.name_custom && m.name_custom.trim()) || (m.name && m.name.trim()) || '';
+      // Determine max PP from the base effect
+      let maxPP = 25;
+      if (m.move_id){
+        const det = await getMoveDetailsById(m.move_id|0);
+        if (det) maxPP = await getMaxPPForStack(det.stack, 25);
+        else if (Array.isArray(m.stack)) maxPP = await getMaxPPForStack(m.stack, 25);
+      } else if (Array.isArray(m.stack)) {
+        maxPP = await getMaxPPForStack(m.stack, 25);
+      }
+
+      // Determine current PP (prefer modern field; else legacy; else name map; else max)
+      let cur = (m.current_pp|0);
+      if (!cur){
+        if (m.pp != null) cur = m.pp|0;
+        else if (displayName && namePPMap && namePPMap[displayName] != null) cur = namePPMap[displayName]|0;
+        else cur = maxPP|0;
+      }
+      cur = Math.min(Math.max(cur|0, 0), maxPP|0);
+
+      // Normalize fields we send outward
+      delete m.pp;
+      m.current_pp = cur;
+      m.max_pp = maxPP;
+      out.push(m);
+    }
+    mon.moves = out;
+    return mon;
+  }catch(_){
+    return mon;
+  }
+}
+
 
 function computePPFromBaseEffect(stack, fallbackPP=20){
   const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
@@ -901,8 +944,11 @@ app.post('/api/logout', auth, async (req,res)=>{ await deleteSession(req.session
 /* ---------- party & heal ---------- */
 app.get('/api/party', auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
+  // attach current_pp/max_pp to every move on every monster
+  for (const mon of party){ await attachPPToMoves(mon); }
   res.json({ party });
 });
+
 app.post('/api/party/reorder', auth, async (req,res)=>{
   try{
     const party = await getParty(req.session.player_id);
@@ -993,12 +1039,39 @@ app.post('/api/monster/move', auth, async (req,res)=>{
 
 
 async function doHeal(owner_id){
+  // Restore HP
   await pool.query(`UPDATE mg_monsters SET hp = max_hp WHERE owner_id=$1`, [owner_id]);
-  await pool.query(`UPDATE mg_monsters SET current_pp = NULL WHERE owner_id=$1`, [owner_id]);
+
+  // Reset PP for every move of every monster to its max
+  const { rows } = await pool.query(`SELECT id, moves FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
+  for (const r of rows){
+    const id = r.id|0;
+    const moves = Array.isArray(r.moves) ? r.moves.slice(0,4) : [];
+    const updated = [];
+    for (const mv of moves){
+      const m = mv ? { ...mv } : {};
+      let maxPP = 25;
+      if (m.move_id){
+        const det = await getMoveDetailsById(m.move_id|0);
+        if (det) maxPP = await getMaxPPForStack(det.stack, 25);
+        else if (Array.isArray(m.stack)) maxPP = await getMaxPPForStack(m.stack, 25);
+      } else if (Array.isArray(m.stack)) {
+        maxPP = await getMaxPPForStack(m.stack, 25);
+      }
+      delete m.pp;
+      m.current_pp = maxPP|0;
+      m.max_pp = maxPP|0;
+      updated.push(m);
+    }
+    await pool.query(`UPDATE mg_monsters SET moves=$1, current_pp=NULL WHERE id=$2 AND owner_id=$3`, [updated, id, owner_id]);
+  }
 
   const party = await getParty(owner_id);
+  // Make sure party includes normalized PP fields when returned
+  for (const mon of party){ await attachPPToMoves(mon); }
   return { ok:true, party };
 }
+
 app.post('/api/heal', auth, async (req,res)=>{ try{ res.json(await doHeal(req.session.player_id)); }catch(e){ res.status(500).json({ error:'server_error' }); }});
 app.get('/api/heal',  auth, async (req,res)=>{ try{ res.json(await doHeal(req.session.player_id)); }catch(e){ res.status(500).json({ error:'server_error' }); }});
 
@@ -1879,14 +1952,16 @@ app.post('/api/battle/start', auth, async (req,res)=>{
 
     const enemy = await buildEnemyFromTile(tile);
     const you = { ...party[idx] };
+    await attachPPToMoves(you);
     const pp = await getCurrentPP(you);
-
+    
     const battle = {
       you, enemy, youIndex: idx, pp,
       log:[`A wild ${enemy.name} appears!`],
       allowCapture:false, owner_id:req.session.player_id,
       requireSwitch:false
     };
+
     battles.set(req.session.token, battle);
 
     res.json({
@@ -1929,6 +2004,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
         b.pp = await getCurrentPP(b.you);
         b.requireSwitch = false;
         b.log.push(`You sent out ${await monName(b.you)}.`);
+        await attachPPToMoves(b.you);
         return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
       }
     
@@ -2168,7 +2244,8 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
           }
           b.requireSwitch = true;
           b.log.push(`Your monster fainted! Choose a replacement.`);
-          return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:true });
+          await attachPPToMoves(b.you);
+          return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
         }
       }
     
