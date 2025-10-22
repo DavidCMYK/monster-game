@@ -295,6 +295,9 @@ async function ensureContentTables() {
       base_pp INT DEFAULT 20,
       tick_source TEXT DEFAULT NULL,             -- e.g. 'PHY' | 'MAG'
       tick_percent NUMERIC(5,2) DEFAULT NULL,    -- e.g. 10.00 = 10%
+      effect_type TEXT DEFAULT '',               -- NEW
+      stat TEXT DEFAULT '',                      -- NEW
+      amount NUMERIC(8,2) DEFAULT 0,             -- NEW
       notes TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS mg_bonuses (
@@ -325,9 +328,28 @@ async function ensureContentTables() {
       stack_bonuses JSONB DEFAULT '[]',          -- ["BONUS_CODE", ...]
       notes TEXT DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS mg_species (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      base_spawn_rate NUMERIC(5,2) DEFAULT 0,
+      biomes TEXT[] DEFAULT '{}',
+      types TEXT[]  DEFAULT '{}',
+      base_hp  INT DEFAULT 0,
+      base_phy INT DEFAULT 0,
+      base_mag INT DEFAULT 0,
+      base_def INT DEFAULT 0,
+      base_res INT DEFAULT 0,
+      base_spd INT DEFAULT 0,
+      base_acc INT DEFAULT 0,
+      base_eva INT DEFAULT 0
+    );
   `);
 
-  // Upgrades for existing installs
+  // Upgrades for existing installs (safe to run every boot)
+  await pool.query(`ALTER TABLE mg_effects  ADD COLUMN IF NOT EXISTS effect_type TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE mg_effects  ADD COLUMN IF NOT EXISTS stat TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE mg_effects  ADD COLUMN IF NOT EXISTS amount NUMERIC(8,2) DEFAULT 0`);
+
   await pool.query(`ALTER TABLE mg_bonuses   ADD COLUMN IF NOT EXISTS description  TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS rescue_flag  BOOLEAN DEFAULT FALSE`);
   await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS field_effect TEXT DEFAULT ''`);
@@ -1300,11 +1322,13 @@ function adminGuard(req, res) {
 
 // Whitelist to avoid arbitrary table access
 const CONTENT_TABLES = {
-  effects:   { table: 'mg_effects',   pk: 'id' },
-  bonuses:   { table: 'mg_bonuses',   pk: 'id' },
+  effects:   { table: 'mg_effects',     pk: 'id' },
+  bonuses:   { table: 'mg_bonuses',     pk: 'id' },
   moves:     { table: 'mg_moves_named', pk: 'id' },
-  abilities: { table: 'mg_abilities', pk: 'id' }
+  abilities: { table: 'mg_abilities',   pk: 'id' },
+  species:   { table: 'mg_species',     pk: 'id' }
 };
+
 
 // GET list (with simple pagination later if needed)
 app.get('/api/admin/db/:kind', auth, async (req, res) => {
@@ -1336,7 +1360,9 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         id, code, name, description='',
         target='target', accuracy_base=1.00, cost=0,
         duration='', base_flag_eligible=false, base_pp=20,
-        tick_source=null, tick_percent=null, notes=''
+        tick_source=null, tick_percent=null,
+        effect_type='', stat='', amount=0,
+        notes=''
       } = body;
       if (!code || !name) return res.status(400).json({ error:'missing_fields' });
 
@@ -1344,18 +1370,22 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         q = `
           UPDATE mg_effects SET
             code=$1, name=$2, description=$3, target=$4, accuracy_base=$5, cost=$6,
-            duration=$7, base_flag_eligible=$8, base_pp=$9, tick_source=$10, tick_percent=$11, notes=$12
-          WHERE id=$13
+            duration=$7, base_flag_eligible=$8, base_pp=$9, tick_source=$10, tick_percent=$11,
+            effect_type=$12, stat=$13, amount=$14, notes=$15
+          WHERE id=$16
           RETURNING *`;
         params = [code, name, description, target, accuracy_base, cost,
-                  duration, base_flag_eligible, base_pp, tick_source, tick_percent, notes, id];
+                  duration, base_flag_eligible, base_pp, tick_source, tick_percent,
+                  effect_type, stat, amount, notes, id];
       } else {
         q = `
-          INSERT INTO mg_effects (code,name,description,target,accuracy_base,cost,duration,base_flag_eligible,base_pp,tick_source,tick_percent,notes)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          INSERT INTO mg_effects
+            (code,name,description,target,accuracy_base,cost,duration,base_flag_eligible,base_pp,tick_source,tick_percent,effect_type,stat,amount,notes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
           RETURNING *`;
         params = [code, name, description, target, accuracy_base, cost,
-                  duration, base_flag_eligible, base_pp, tick_source, tick_percent, notes];
+                  duration, base_flag_eligible, base_pp, tick_source, tick_percent,
+                  effect_type, stat, amount, notes];
       }
     } else if (kind === 'bonuses') {
       const {
@@ -1422,6 +1452,49 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
           VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)
           RETURNING *`;
         params = [code, name, !!rescue_flag, field_effect, JSON.stringify(eff), JSON.stringify(bon), notes];
+      }
+    } else if (kind === 'species') {
+      const {
+        id,
+        name,
+        base_spawn_rate = 0,
+        biomes = [],
+        types  = [],
+        base_hp = 0, base_phy = 0, base_mag = 0,
+        base_def = 0, base_res = 0, base_spd = 0,
+        base_acc = 0, base_eva = 0
+      } = body;
+
+      if (!name) return res.status(400).json({ error:'missing_fields' });
+
+      const asArray = v => Array.isArray(v) ? v : String(v||'').split(',').map(s=>s.trim()).filter(Boolean);
+
+      const biomesArr = asArray(biomes);
+      const typesArr  = asArray(types);
+
+      const ints = v => Number.isFinite(+v) ? parseInt(v,10) : 0;
+
+      if (id) {
+        q = `
+          UPDATE mg_species SET
+            name=$1, base_spawn_rate=$2, biomes=$3, types=$4,
+            base_hp=$5, base_phy=$6, base_mag=$7, base_def=$8, base_res=$9, base_spd=$10, base_acc=$11, base_eva=$12
+          WHERE id=$13
+          RETURNING *`;
+        params = [ name, base_spawn_rate, biomesArr, typesArr,
+                   ints(base_hp), ints(base_phy), ints(base_mag),
+                   ints(base_def), ints(base_res), ints(base_spd),
+                   ints(base_acc), ints(base_eva), id ];
+      } else {
+        q = `
+          INSERT INTO mg_species
+            (name,base_spawn_rate,biomes,types,base_hp,base_phy,base_mag,base_def,base_res,base_spd,base_acc,base_eva)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          RETURNING *`;
+        params = [ name, base_spawn_rate, biomesArr, typesArr,
+                   ints(base_hp), ints(base_phy), ints(base_mag),
+                   ints(base_def), ints(base_res), ints(base_spd),
+                   ints(base_acc), ints(base_eva) ];
       }
     } else {
       return res.status(400).json({ error:'bad_kind' });
