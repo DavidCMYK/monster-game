@@ -280,6 +280,7 @@ const CHUNK_W = 256, CHUNK_H = 256;
 // We’ll store effects/bonuses/moves_named/abilities directly in Postgres.
 // This helper creates tables if they don’t exist. Call it on boot.
 async function ensureContentTables() {
+  // Base creates (idempotent)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_effects (
       id SERIAL PRIMARY KEY,
@@ -289,7 +290,7 @@ async function ensureContentTables() {
       target TEXT DEFAULT 'target',              -- 'self' | 'target'
       accuracy_base NUMERIC(5,2) DEFAULT 1.00,   -- 0..1
       cost INT DEFAULT 0,
-      duration TEXT DEFAULT '',                  -- '' | '-1' | 'N' (string form to keep it simple)
+      duration TEXT DEFAULT '',                  -- '' | '-1' | 'N'
       base_flag_eligible BOOLEAN DEFAULT FALSE,  -- eligible to be a base effect
       base_pp INT DEFAULT 20,
       tick_source TEXT DEFAULT NULL,             -- e.g. 'PHY' | 'MAG'
@@ -300,27 +301,40 @@ async function ensureContentTables() {
       id SERIAL PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
-      target_metric TEXT DEFAULT '',     -- e.g. 'damage','accuracy','pp','element:Fire'
-      value_type TEXT DEFAULT 'flat',    -- 'flat' | 'percent' | 'tag'
-      value NUMERIC(8,2) DEFAULT 0,      -- number when flat/percent; ignored if tag
+      description TEXT DEFAULT '',
+      target_metric TEXT DEFAULT '',
+      value_type TEXT DEFAULT 'flat',            -- 'flat' | 'percent' | 'tag'
+      value NUMERIC(8,2) DEFAULT 0,
       cost INT DEFAULT 0,
       notes TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS mg_moves_named (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
-      stack_effects JSONB DEFAULT '[]',  -- ["EFFECT_CODE", ...]
-      stack_bonuses JSONB DEFAULT '[]',  -- ["BONUS_CODE", ...]
+      stack_effects JSONB DEFAULT '[]',          -- ["EFFECT_CODE", ...]
+      stack_bonuses JSONB DEFAULT '[]',          -- ["BONUS_CODE", ...]
       notes TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS mg_abilities (
       id SERIAL PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
+      rescue_flag BOOLEAN DEFAULT FALSE,
+      field_effect TEXT DEFAULT '',
+      stack_effects JSONB DEFAULT '[]',          -- ["EFFECT_CODE", ...]
+      stack_bonuses JSONB DEFAULT '[]',          -- ["BONUS_CODE", ...]
       notes TEXT DEFAULT ''
     );
   `);
-  console.log('[DB] Content tables ensured');
+
+  // Upgrades for existing installs
+  await pool.query(`ALTER TABLE mg_bonuses   ADD COLUMN IF NOT EXISTS description  TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS rescue_flag  BOOLEAN DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS field_effect TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS stack_effects JSONB DEFAULT '[]'`);
+  await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS stack_bonuses JSONB DEFAULT '[]'`);
+
+  console.log('[DB] Content tables ensured/updated');
 }
 ensureContentTables().catch(e => console.error('ensureContentTables error:', e));
 
@@ -1345,22 +1359,22 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       }
     } else if (kind === 'bonuses') {
       const {
-        id, code, name, target_metric='', value_type='flat', value=0, cost=0, notes=''
+        id, code, name, description='', target_metric='', value_type='flat', value=0, cost=0, notes=''
       } = body;
       if (!code || !name) return res.status(400).json({ error:'missing_fields' });
       if (id) {
         q = `
           UPDATE mg_bonuses SET
-            code=$1, name=$2, target_metric=$3, value_type=$4, value=$5, cost=$6, notes=$7
-          WHERE id=$8
+            code=$1, name=$2, description=$3, target_metric=$4, value_type=$5, value=$6, cost=$7, notes=$8
+          WHERE id=$9
           RETURNING *`;
-        params = [code, name, target_metric, value_type, value, cost, notes, id];
+        params = [code, name, description, target_metric, value_type, value, cost, notes, id];
       } else {
         q = `
-          INSERT INTO mg_bonuses (code,name,target_metric,value_type,value,cost,notes)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          INSERT INTO mg_bonuses (code,name,description,target_metric,value_type,value,cost,notes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
           RETURNING *`;
-        params = [code, name, target_metric, value_type, value, cost, notes];
+        params = [code, name, description, target_metric, value_type, value, cost, notes];
       }
     } else if (kind === 'moves') {
       const { id, name, stack_effects=[], stack_bonuses=[], notes='' } = body;
@@ -1382,21 +1396,32 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         params = [name, JSON.stringify(eff), JSON.stringify(bon), notes];
       }
     } else if (kind === 'abilities') {
-      const { id, code, name, notes='' } = body;
+      const {
+        id, code, name,
+        rescue_flag=false,
+        field_effect='',
+        stack_effects=[],
+        stack_bonuses=[],
+        notes=''
+      } = body;
       if (!code || !name) return res.status(400).json({ error:'missing_fields' });
+
+      const eff = Array.isArray(stack_effects) ? stack_effects : [];
+      const bon = Array.isArray(stack_bonuses) ? stack_bonuses : [];
+
       if (id) {
         q = `
           UPDATE mg_abilities SET
-            code=$1, name=$2, notes=$3
-          WHERE id=$4
+            code=$1, name=$2, rescue_flag=$3, field_effect=$4, stack_effects=$5::jsonb, stack_bonuses=$6::jsonb, notes=$7
+          WHERE id=$8
           RETURNING *`;
-        params = [code, name, notes, id];
+        params = [code, name, !!rescue_flag, field_effect, JSON.stringify(eff), JSON.stringify(bon), notes, id];
       } else {
         q = `
-          INSERT INTO mg_abilities (code,name,notes)
-          VALUES ($1,$2,$3)
+          INSERT INTO mg_abilities (code,name,rescue_flag,field_effect,stack_effects,stack_bonuses,notes)
+          VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)
           RETURNING *`;
-        params = [code, name, notes];
+        params = [code, name, !!rescue_flag, field_effect, JSON.stringify(eff), JSON.stringify(bon), notes];
       }
     } else {
       return res.status(400).json({ error:'bad_kind' });
