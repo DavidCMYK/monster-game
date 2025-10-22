@@ -1497,13 +1497,23 @@ function adminGuard(req, res) {
 }
 
 // Whitelist to avoid arbitrary table access
+// writable=false kinds will be view-only in the editor
 const CONTENT_TABLES = {
-  effects:   { table: 'mg_effects',     pk: 'id' },
-  bonuses:   { table: 'mg_bonuses',     pk: 'id' },
-  moves:     { table: 'mg_moves_named', pk: 'id' },
-  abilities: { table: 'mg_abilities',   pk: 'id' },
-  species:   { table: 'mg_species',     pk: 'id' }
+  // Existing "content" tables — keep editable
+  effects:    { table: 'mg_effects',     pk: 'id',     writable: true  },
+  bonuses:    { table: 'mg_bonuses',     pk: 'id',     writable: true  },
+  moves:      { table: 'mg_moves_named', pk: 'id',     writable: true  },
+  abilities:  { table: 'mg_abilities',   pk: 'id',     writable: true  },
+  species:    { table: 'mg_species',     pk: 'id',     writable: true  },
+
+  // Additional tables — view-only (safe)
+  players:        { table: 'mg_players',       pk: 'id',     writable: false },
+  sessions:       { table: 'mg_sessions',      pk: 'token',  writable: false },
+  player_state:   { table: 'mg_player_state',  pk: 'player_id', writable: false },
+  monsters:       { table: 'mg_monsters',      pk: 'id',     writable: false },
+  moves_canon:    { table: 'mg_moves',         pk: 'id',     writable: false },
 };
+
 
 
 // GET list (with simple pagination later if needed)
@@ -1528,6 +1538,11 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
   const meta = CONTENT_TABLES[kind];
   if (!meta) return res.status(400).json({ error: 'bad_kind' });
 
+  // Block edits on read-only kinds
+  if (!meta.writable) {
+    return res.status(403).json({ error: 'read_only', message: `The '${kind}' table is view-only.` });
+  }
+  
   const body = req.body || {};
   try {
     let q, params;
@@ -1690,6 +1705,12 @@ app.delete('/api/admin/db/:kind/:id', auth, async (req, res) => {
   const kind = String(req.params.kind || '').toLowerCase();
   const meta = CONTENT_TABLES[kind];
   if (!meta) return res.status(400).json({ error: 'bad_kind' });
+
+  // Block deletes on read-only kinds
+  if (!meta.writable) {
+    return res.status(403).json({ error: 'read_only', message: `The '${kind}' table is view-only.` });
+  }
+  
   const id = Number(req.params.id || 0);
   if (!id) return res.status(400).json({ error: 'bad_id' });
   try {
@@ -2008,20 +2029,7 @@ async function buildEnemyFromTile(tile){
 
 app.post('/api/battle/start', auth, async (req,res)=>{
   try{
-    // If a battle already exists for this session, return it instead of creating a new one.
-    //const existing = battles.get(req.session.token);
-    //if (existing){
-    //  return res.json({
-    //    you: existing.you,
-    //    enemy: existing.enemy,
-    //    youIndex: existing.youIndex|0,
-    //    pp: existing.pp || {},
-    //    log: existing.log || [],
-    //    allowCapture: !!existing.allowCapture,
-    //    requireSwitch: !!existing.requireSwitch
-    //  });
-    //}
-    // Instead, proactively discard any old battle:
+    // proactively discard any old battle:
     if (battles.has(req.session.token)) battles.delete(req.session.token);
     
     const party = await getParty(req.session.player_id);
