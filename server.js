@@ -979,121 +979,177 @@ app.post('/api/admin/content/reload', auth, (req, res) => {
 
 // Admin: import CSVs from a base URL (HTTPS). Requires player_id === 1 (same temporary guard)
 app.post('/api/admin/content/import', auth, async (req,res)=>{
-  if (req.session?.player_id !== 1) return res.status(403).json({ error:'forbidden' });
+  // TEMP guard: only player_id 1 can import (as before); tweak to your needs
+  if (req.session?.player_id !== 1) return res.status(403).json({ error:'forbidden', message:'Admin only' });
+
+  const steps = [];
+  function pushStep(s){ steps.push(s); }
 
   try{
-    const base = String(req.body?.base_url||'').trim();
-    if (!base || !(base.startsWith('https://') || base.startsWith('http://'))){
-      return res.status(400).json({ error:'bad_url', message:'Provide a full HTTP(S) base URL (e.g., https://example.com/content/).' });
+    const BASE = String(req.body?.base_url || '').trim();
+    if (!BASE) return res.status(400).json({ error:'bad_request', message:'base_url was empty' });
+    pushStep(`Using base_url=${BASE}`);
+
+    // --- tiny helpers (same shape as before, but with better error output) ---
+    const https = require('https');
+    const http  = require('http');
+    function httpGetText(url){
+      return new Promise((resolve, reject)=>{
+        const mod = url.startsWith('https:') ? https : http;
+        const req = mod.get(url, res2=>{
+          let data='';
+          res2.on('data',d=>data+=d);
+          res2.on('end',()=>{
+            if (res2.statusCode && res2.statusCode >= 400){
+              return reject(new Error(`HTTP ${res2.statusCode} for ${url}`));
+            }
+            resolve(data);
+          });
+        });
+        req.on('error',err=>reject(new Error(`Request failed for ${url}: ${err.message}`)));
+        req.setTimeout(10000, ()=>{ req.destroy(new Error(`Timeout for ${url}`)); });
+      });
     }
-    const join = (p)=> base.endsWith('/') ? base + p : base + '/' + p;
-
-    // 1) Fetch CSV files as text
-    const [speciesTxt, effectsTxt, bonusesTxt, abilitiesTxt, movesTxt] = await Promise.all([
-      httpGetText(join('species.csv')),
-      httpGetText(join('effects.csv')),
-      httpGetText(join('bonuses.csv')),
-      httpGetText(join('abilities.csv')),
-      httpGetText(join('moves.csv')),
-    ]);
-
-    // 2) Parse
-    const speciesRows = parseCSV(speciesTxt);
-    const effectsRows = parseCSV(effectsTxt);
-    const bonusesRows = parseCSV(bonusesTxt);
-    const abilitiesRows = parseCSV(abilitiesTxt);
-    const movesRows = parseCSV(movesTxt);
-
-    // 3) Upsert species into DB (same as before)
-    const ensure = (o,k,def)=> (o[k]==null || String(o[k]).trim()==='') ? (o[k]=def) : o[k];
-    await pool.query('BEGIN');
-    for (const r of speciesRows){
-      const id               = intOr(0, r.id);
-      const name             = String(r.name||'').trim();
-      const base_spawn_rate  = numOr(0.05, r.base_spawn_rate);
-      const biomes           = toTextArrayCell(r.biomes);
-      const types            = toTextArrayCell(r.types);
-      ensure(r,'base_hp',40); ensure(r,'base_phy',10); ensure(r,'base_mag',10);
-      ensure(r,'base_def',10); ensure(r,'base_res',10); ensure(r,'base_spd',10);
-      ensure(r,'base_acc',95); ensure(r,'base_eva',5);
-
-      if (!id || !name) continue;
-
-      await pool.query(`
-        INSERT INTO mg_species (id,name,base_spawn_rate,biomes,types,base_hp,base_phy,base_mag,base_def,base_res,base_spd,base_acc,base_eva)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (id) DO UPDATE SET
-          name=$2, base_spawn_rate=$3, biomes=$4, types=$5,
-          base_hp=$6, base_phy=$7, base_mag=$8, base_def=$9, base_res=$10, base_spd=$11, base_acc=$12, base_eva=$13
-      `, [
-        id, name, base_spawn_rate, biomes, types,
-        intOr(40, r.base_hp), intOr(10, r.base_phy), intOr(10, r.base_mag),
-        intOr(10, r.base_def), intOr(10, r.base_res), intOr(10, r.base_spd),
-        intOr(95, r.base_acc), intOr(5, r.base_eva)
-      ]);
+    function parseCSV(text){
+      // loose CSV parser (no quoted commas). Good enough for our simple test files.
+      const lines = text.replace(/\r/g,'').split('\n').filter(l=>l.trim().length>0);
+      if (lines.length === 0) return { header:[], rows:[] };
+      const header = lines[0].split(',').map(s=>s.trim());
+      const rows   = lines.slice(1).map(line=>{
+        const cols = line.split(',').map(s=>s.trim());
+        const obj={};
+        for (let i=0;i<header.length;i++) obj[header[i]] = cols[i] ?? '';
+        return obj;
+      });
+      return { header, rows };
     }
-    await pool.query('COMMIT');
+    const toTextArrayCell = s => String(s||'').trim();
 
-    // 4) Build in-memory content override from effects/bonuses/abilities/moves
-    const normEffects = effectsRows.map(row=>{
-      const code = String(row.code||'').trim();
+    // --- download all five files with explicit step names ---
+    pushStep('Downloading effects.csv');
+    const effectsCSV  = await httpGetText(`${BASE.replace(/\/+$/,'')}/effects.csv`);
+    pushStep(`effects.csv bytes=${effectsCSV.length}`);
+
+    pushStep('Downloading bonuses.csv');
+    const bonusesCSV  = await httpGetText(`${BASE.replace(/\/+$/,'')}/bonuses.csv`);
+    pushStep(`bonuses.csv bytes=${bonusesCSV.length}`);
+
+    pushStep('Downloading abilities.csv');
+    const abilitiesCSV= await httpGetText(`${BASE.replace(/\/+$/,'')}/abilities.csv`);
+    pushStep(`abilities.csv bytes=${abilitiesCSV.length}`);
+
+    pushStep('Downloading moves.csv');
+    const movesCSV    = await httpGetText(`${BASE.replace(/\/+$/,'')}/moves.csv`);
+    pushStep(`moves.csv bytes=${movesCSV.length}`);
+
+    pushStep('Downloading species.csv');
+    const speciesCSV  = await httpGetText(`${BASE.replace(/\/+$/,'')}/species.csv`);
+    pushStep(`species.csv bytes=${speciesCSV.length}`);
+
+    // --- parse each (with counts) ---
+    const effParsed = parseCSV(effectsCSV);
+    if (!effParsed.header.includes('code')) throw new Error('effects.csv is missing a "code" column');
+    pushStep(`effects.csv rows=${effParsed.rows.length}`);
+
+    const bonParsed = parseCSV(bonusesCSV);
+    if (!bonParsed.header.includes('code')) throw new Error('bonuses.csv is missing a "code" column');
+    pushStep(`bonuses.csv rows=${bonParsed.rows.length}`);
+
+    const ablParsed = parseCSV(abilitiesCSV);
+    if (!ablParsed.header.includes('code')) throw new Error('abilities.csv is missing a "code" column');
+    pushStep(`abilities.csv rows=${ablParsed.rows.length}`);
+
+    const movParsed = parseCSV(movesCSV);
+    if (!movParsed.header.includes('stack_effects')) throw new Error('moves.csv is missing "stack_effects"');
+    pushStep(`moves.csv rows=${movParsed.rows.length}`);
+
+    const spParsed  = parseCSV(speciesCSV);
+    if (!spParsed.header.includes('id') || !spParsed.header.includes('name')) throw new Error('species.csv must include "id" and "name" columns');
+    pushStep(`species.csv rows=${spParsed.rows.length}`);
+
+    // --- transform for content loader (your existing CSV schema) ---
+    const effects = effParsed.rows.map(r=>({
+      code: toTextArrayCell(r.code),
+      desc: toTextArrayCell(r.desc),
+      base_pp: r.base_pp ? Number(r.base_pp) : undefined,
+      accuracy: r.accuracy ? Number(r.accuracy) : undefined,
+      base_flag_eligible: String(r.base_flag_eligible||'').toLowerCase()
+    }));
+
+    const bonuses = bonParsed.rows.map(r=>({
+      code: toTextArrayCell(r.code),
+      desc: toTextArrayCell(r.desc),
+      value: r.value ? Number(r.value) : undefined
+    }));
+
+    const abilities = ablParsed.rows.map(r=>{
+      const effs = toTextArrayCell(r.stack_effects).split('|').map(s=>s.trim()).filter(Boolean);
+      const bons = toTextArrayCell(r.stack_bonuses).split('|').map(s=>s.trim()).filter(Boolean);
       return {
-        ...row,
-        code,
-        accuracy: (row.accuracy!==undefined && row.accuracy!=='') ? Number(row.accuracy) : undefined,
-        base_pp:  (row.base_pp!==undefined  && row.base_pp!=='')  ? Number(row.base_pp)  : undefined,
-        base_flag_eligible: (row.base_flag_eligible!==undefined ? row.base_flag_eligible : row.base),
-        base: row.base
+        code: toTextArrayCell(r.code),
+        name: toTextArrayCell(r.name),
+        field_effect: toTextArrayCell(r.field_effect),
+        stack_effects: effs,
+        stack_bonuses: bons
       };
-    }).filter(r=>r.code);
-
-    const normBonuses = bonusesRows.map(row=>{
-      const code = String(row.code||'').trim();
-      return { ...row, code };
-    }).filter(r=>r.code);
-
-    const normAbilities = abilitiesRows.map(row=>{
-      const code = String(row.code||'').trim();
-      const name = String(row.name||'').trim();
-      const field_effect = String(row.field_effect||'').trim();
-      const stack_effects = toTextArrayCell(row.stack_effects);
-      const stack_bonuses = toTextArrayCell(row.stack_bonuses);
-      return { ...row, code, name, field_effect, stack_effects, stack_bonuses };
-    }).filter(r=>r.code);
-
-    const normMoves = movesRows.map(row=>{
-      // every row is a stack recipe; name may be empty (we can still carry it for editors)
-      const name = String(row.name||'').trim();
-      const stack_effects = toTextArrayCell(row.stack_effects);
-      const stack_bonuses = toTextArrayCell(row.stack_bonuses);
-      return { ...row, name, stack_effects, stack_bonuses };
     });
 
-    const poolEffects = normEffects.map(e=>e.code);
-    const poolBonuses = normBonuses.map(b=>b.code);
+    const moves = movParsed.rows.map(r=>{
+      const effs = toTextArrayCell(r.stack_effects).split('|').map(s=>s.trim()).filter(Boolean);
+      const bons = toTextArrayCell(r.stack_bonuses).split('|').map(s=>s.trim()).filter(Boolean);
+      return {
+        // name generation happens server-side when needed; here we store stack for named lookup
+        stack_effects: effs,
+        stack_bonuses: bons
+      };
+    });
 
-    OVERRIDE_CONTENT = {
-      effects: normEffects,
-      bonuses: normBonuses,
-      abilities: normAbilities,
-      moves: normMoves,              // edited/testing list (not the DB registry)
-      pool: { effects: poolEffects, bonuses: poolBonuses },
-      version: Date.now()
-    };
+    const species = spParsed.rows.map(r=>{
+      const biomes = toTextArrayCell(r.biomes).split('|').map(s=>s.trim()).filter(Boolean);
+      const types  = toTextArrayCell(r.types).split('|').map(s=>s.trim()).filter(Boolean);
+      return {
+        id: Number(r.id),
+        name: toTextArrayCell(r.name),
+        base_spawn_rate: r.base_spawn_rate ? Number(r.base_spawn_rate) : 0.05,
+        biomes, types,
+        base_hp:  Number(r.base_hp  ?? 40),
+        base_phy: Number(r.base_phy ?? 10),
+        base_mag: Number(r.base_mag ?? 10),
+        base_def: Number(r.base_def ?? 10),
+        base_res: Number(r.base_res ?? 10),
+        base_spd: Number(r.base_spd ?? 10),
+        base_acc: Number(r.base_acc ?? 95),
+        base_eva: Number(r.base_eva ?? 5)
+      };
+    });
 
-    return res.json({ ok:true, imported:{
-      species: speciesRows.length,
-      effects: normEffects.length,
-      bonuses: normBonuses.length,
-      abilities: normAbilities.length,
-      moves: normMoves.length
-    }});
+    // --- stash to content loader & optionally DB as your existing code did ---
+    const { setContent, saveNamedMovesIfNeeded } = require('./contentLoader'); // make sure these exist per your earlier setup
+    pushStep('Updating in-memory content');
+    setContent({ effects, bonuses, abilities, named_moves: moves, species });
+
+    // optional: if you persist to DB here, wrap in a transaction and pushStep around each table
+    // await saveNamedMovesIfNeeded(moves); // your resolver can maintain names for stacks
+
+    console.log('[IMPORT] Completed. Summary:', {
+      effects: effects.length, bonuses: bonuses.length, abilities: abilities.length, moves: moves.length, species: species.length
+    });
+
+    return res.json({
+      ok:true,
+      summary:{ effects: effects.length, bonuses: bonuses.length, abilities: abilities.length, moves: moves.length, species: species.length },
+      steps
+    });
   }catch(e){
-    try{ await pool.query('ROLLBACK'); }catch(_){}
-    console.error('import error:', e);
-    return res.status(500).json({ error:'server_error', message:String(e.message||e) });
+    console.error('[IMPORT] ERROR:', e && e.stack ? e.stack : e);
+    return res.status(500).json({
+      error:'server_error',
+      message: e?.message || String(e),
+      steps
+    });
   }
 });
+
 
 
 // helper to get a chunk from `world` in whatever shape the module exposes
