@@ -982,8 +982,8 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
     return res.status(403).json({ ok:false, error:'forbidden_admin_only' });
   }
 
-  // Optional: put your CSV base URL in an env var; otherwise default to your URL
-  const BASE = process.env.MG_CONTENT_BASE_URL || 'https://davidchurchermuria.com/games/monster-game/content';
+  // Prefer body.base_url, then env, then default
+  const BASE = (req.body?.base_url || process.env.MG_CONTENT_BASE_URL || 'https://davidchurchermuria.com/games/monster-game/content').replace(/\/+$/,'');
 
   // Helper: small https GET that returns whole body
   const https = require('https');
@@ -1143,14 +1143,17 @@ app.post('/api/admin/content/import', auth, async (req, res) => {
     });
 
   } catch (e) {
+    const reason = String(e && e.message ? e.message : e);
     console.error('Import error:', e && e.stack ? e.stack : e);
-    // Always send structured JSON so the client can show the real reason
+    // Put the human-readable reason in `message` so the client shows it
     return res.status(500).json({
       ok: false,
       error: 'server_error',
-      details: String(e && e.message ? e.message : e),
+      message: reason,
+      details: reason
     });
   }
+
 });
 
 // helper to get a chunk from `world` in whatever shape the module exposes
