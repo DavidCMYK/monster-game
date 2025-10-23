@@ -770,7 +770,12 @@ async function ensureStarterMoves(owner_id){
   if (!rows.length) return;
   const id = rows[0].id;
   let moves = rows[0].moves || [];
-  const hasGuard = moves.some(m => (m.name||'').toLowerCase()==='guard');
+  try {
+    const hasGuard = moves.some(m => (m.name||'').toLowerCase()==='guard')
+  }catch (e) {
+    console.log("HasGuard failed");
+  };
+  
   if (!hasGuard){
     moves = moves.slice(0,3).concat([{ name:'Guard', base:'status', power:0, accuracy:1.0, pp:15, stack:['buff_def'] }]);
     await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`, [JSON.stringify(moves), id, owner_id]);
