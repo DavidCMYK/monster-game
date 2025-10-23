@@ -1443,7 +1443,7 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       const {
         id,
         owner_id,
-        speciesId,
+        species_id,
         nickname,
         level,
         xp,
@@ -1472,21 +1472,21 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       if (id) {
         q = `
           UPDATE mg_monsters SET
-            owner_id=$2, speciesId=$3, nickname=$4,
+            owner_id=$2, species_id=$3, nickname=$4,
             level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10, slot=$11, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
           WHERE id=$1
           RETURNING *`;
-        params = [ id, owner_id, speciesId, nickname,
+        params = [ id, owner_id, species_id, nickname,
                    ints(level), ints(xp), ints(hp),
                    ints(max_hp), ability, moves,
                    ints(slot), growth, ints(current_pp), learned_pool, learn_list ];
       } else {
         q = `
-          INSERT INTO mg_species
-            (owner_id, speciesId, nickname, level, xp, hp, max_hp, ability, moves, slot, growth, current_pp, learned_pool, learn_list)
+          INSERT INTO mg_monsters
+            (owner_id, species_id, nickname, level, xp, hp, max_hp, ability, moves, slot, growth, current_pp, learned_pool, learn_list)
           VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
           RETURNING *`;
-        params = [ id, owner_id, speciesId, nickname,
+        params = [ id, owner_id, species_id, nickname,
                    ints(level), ints(xp), ints(hp),
                    ints(max_hp), ability, moves,
                    ints(slot), growth, ints(current_pp), learned_pool, learn_list ];
