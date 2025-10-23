@@ -987,7 +987,8 @@ app.post('/api/login', async (req,res)=>{
     console.log("Create session");
     const tok = await createSession(p.id);
     console.log("Check player has party");
-    await ensureHasParty(p.id); await ensureStarterMoves(p.id);
+    await ensureHasParty(p.id);
+    //await ensureStarterMoves(p.id);
     console.log("Get state");
     const st = await getState(p.id);
     console.log("Get party");
@@ -1000,7 +1001,7 @@ app.post('/api/login', async (req,res)=>{
 });
 app.get('/api/session', auth, async (req,res)=>{
   await ensureHasParty(req.session.player_id);
-  await ensureStarterMoves(req.session.player_id);
+  //await ensureStarterMoves(req.session.player_id);
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   res.json({ token: req.session.token, player: { handle:req.session.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
