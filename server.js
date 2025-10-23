@@ -1293,8 +1293,14 @@ app.get('/api/admin/db/:kind', auth, async (req, res) => {
 
 // UPSERT (insert if no id; update if id is present)
 app.post('/api/admin/db/:kind', auth, async (req, res) => {
+
+  //check that the user is admin
   if (!adminGuard(req, res)) return;
+
+  //get the kind (table name) from the passed request
   const kind = String(req.params.kind || '').toLowerCase();
+
+  //pick the correct table. If doesn't exist, error 400
   const meta = CONTENT_TABLES[kind];
   if (!meta) return res.status(400).json({ error: 'bad_kind' });
 
@@ -1448,6 +1454,7 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
                    ints(base_acc), ints(base_eva) ];
       }
     } else if (kind === 'monsters') {
+      console.log(JSON.stringify(body));
       const {
         id,
         owner_id,
@@ -1459,12 +1466,14 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         max_hp,
         ability,
         moves,
-        slot,
-        growth,
-        current_pp,
-        learned_pool = {"effects":{},"bonuses":{}},
-        learn_list = {"effects":{},"bonuses":{}},
+        slot//,
+        //growth,
+        //current_pp,
+        //learned_pool = {"effects":{},"bonuses":{}},
+        //learn_list = {"effects":{},"bonuses":{}},
       } = body;
+
+      console.log(moves);
 
       if (!id) return res.status(400).json({ error:'missing_fields' });
 
@@ -1477,27 +1486,26 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       //create a function that takes one input (v) and converts it to an integer
       const ints = v => Number.isFinite(+v) ? parseInt(v,10) : 0;
 
-      if (id) {
+      if (id) { //, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
         q = `
           UPDATE mg_monsters SET
-            owner_id=$2, species_id=$3, nickname=$4,
-            level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10, slot=$11, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
+            owner_id=$2, species_id=$3, nickname=$4,level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10, slot=$11 
           WHERE id=$1
           RETURNING *`;
         params = [ id, owner_id, species_id, nickname,
                    ints(level), ints(xp), ints(hp),
-                   ints(max_hp), ability, moves,
-                   ints(slot), growth, ints(current_pp), learned_pool, learn_list ];
-      } else {
+                   ints(max_hp), ability, moves, ints(slot)//, growth, ints(current_pp), learned_pool, learn_list
+        ];
+      } else { //, growth, current_pp, learned_pool, learn_list
         q = `
           INSERT INTO mg_monsters
-            (owner_id, species_id, nickname, level, xp, hp, max_hp, ability, moves, slot, growth, current_pp, learned_pool, learn_list)
-          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            (owner_id, species_id, nickname, level, xp, hp, max_hp, ability, moves, slot)
+          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
           RETURNING *`;
-        params = [ id, owner_id, species_id, nickname,
+        params = [ id, owner_id, species_id, nickname, //,$12
                    ints(level), ints(xp), ints(hp),
-                   ints(max_hp), ability, moves,
-                   ints(slot), growth, ints(current_pp), learned_pool, learn_list ];
+                   ints(max_hp), ability, moves,ints(slot)//, growth, ints(current_pp), learned_pool, learn_list 
+        ];
       }
     } else {
       return res.status(400).json({ error:'bad_kind' });
