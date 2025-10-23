@@ -974,16 +974,24 @@ app.post('/api/register', async (req,res)=>{
 app.post('/api/login', async (req,res)=>{
   try{
     const { email,password } = req.body||{};
+    console.log("Get player");
     const p = await getPlayerByEmail(email);
     if (!p) return res.status(401).json({ error:'Invalid credentials' });
     const ok = await bcrypt.compare(password, p.password_hash);
     if (!ok) return res.status(401).json({ error:'Invalid credentials' });
+    console.log("Create session");
     const tok = await createSession(p.id);
+    console.log("Check player has party");
     await ensureHasParty(p.id); await ensureStarterMoves(p.id);
+    console.log("Get state");
     const st = await getState(p.id);
+    console.log("Get party");
     const party = await getParty(p.id);
     res.json({ token: tok, player: { handle:p.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
-  }catch(e){ res.status(500).json({ error:'server_error' }); }
+  }catch(e){
+    console.error('LOGIN ERROR:', e); // helps confirm it was a missing column
+    res.status(500).json({ error:'server_error' });
+  }
 });
 app.get('/api/session', auth, async (req,res)=>{
   await ensureHasParty(req.session.player_id);
