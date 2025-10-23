@@ -175,7 +175,6 @@ function generatedMoveName(stack, bonuses){
   return (left + right) || 'Custom';
 }
 
-// Ensure there is a row in mg_moves for this exact combo; return its name
 // Ensure there is a row in mg_moves for this exact combo; return {id,name}
 async function ensureMoveRecord(stack, bonuses){
   const { s, bon } = canonicalizeStackAndBonuses(stack, bonuses);
@@ -463,7 +462,9 @@ async function ensureContentTables() {
 
   console.log('[DB] Content tables ensured/updated');
 }
+
 ensureContentTables().catch(e => console.error('ensureContentTables error:', e));
+
 // --- Move naming & persistence ---------------------------------------------
 function normalizeMoveParts(stack, bonuses){
   // Keep base effect first; sort the rest for stable matching; de-dup
@@ -1234,258 +1235,6 @@ app.get('/api/content/moves', auth, (req, res) => {
 });
 
 
-// Optional: quick admin-only reload (temporary guard: player_id === 1)
-app.post('/api/admin/content/reload', auth, (req, res) => {
-  if (req.session?.player_id !== 1) return res.status(403).json({ error:'forbidden' });
-  const c = reloadContent();
-  return res.json({ ok:true, version: c?.version || 0 });
-});
-
-// Admin: import CSVs from a base URL (HTTPS). Requires player_id === 1 (same temporary guard)
-app.post('/api/admin/content/import', auth, async (req, res) => {
-  // Admin guard (keep as you prefer)
-  if (!req.session || req.session.player_id !== 1) {
-    return res.status(403).json({ ok:false, error:'forbidden_admin_only' });
-  }
-
-  // Prefer body.base_url, then env, then default
-  const BASE = (req.body?.base_url || process.env.MG_CONTENT_BASE_URL || 'https://davidchurchermuria.com/games/monster-game/content').replace(/\/+$/,'');
-
-  // Robust GET with polite headers, Retry-After support, and exponential backoff
-  const https = require('https');
-  const http  = require('http');
-
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  async function getTextWithRetry(url, tries = 7, baseDelayMs = 800){
-    const isHttps = /^https:/i.test(url);
-    const mod = isHttps ? https : http;
-
-    for (let attempt = 1; attempt <= tries; attempt++){
-      const { body, statusCode, retryAfter } = await new Promise((resolve) => {
-        const req = mod.request(
-          url,
-          {
-            method: 'GET',
-            headers: {
-              // Some hosts rate-limit generic bots; send a polite UA and avoid compression
-              'User-Agent': 'MonsterGameContentImporter/1.0 (+contact: admin@yourdomain.tld)',
-              'Accept': 'text/csv, text/plain, */*',
-              'Accept-Encoding': 'identity',
-              'Connection': 'close'
-            },
-            timeout: 15000
-          },
-          (res) => {
-            let data = '';
-            res.setEncoding('utf8');
-            res.on('data', (chunk) => { data += chunk; });
-            res.on('end', () => {
-              const ra = res.headers && (res.headers['retry-after'] || res.headers['Retry-After']);
-              resolve({ body: data, statusCode: res.statusCode || 0, retryAfter: ra });
-            });
-          }
-        );
-        req.on('timeout', () => { req.destroy(new Error(`Timeout for ${url}`)); });
-        req.on('error', (err) => {
-          // Bubble the error up as a synthetic response so we can apply retries
-          resolve({ body: String(err && err.message || err), statusCode: 599, retryAfter: null });
-        });
-        req.end();
-      });
-
-      // Success (2xx)
-      if (statusCode >= 200 && statusCode < 300) return body;
-
-      // If 429 or 503, respect Retry-After or exponential backoff
-      if (statusCode === 429 || statusCode === 503){
-        let waitMs = baseDelayMs * Math.pow(2, attempt - 1);
-        if (retryAfter){
-          const secs = Number(retryAfter);
-          if (!Number.isNaN(secs) && secs > 0){
-            waitMs = Math.max(waitMs, secs * 1000);
-          }
-        }
-        // jitter ±25%
-        const jitter = Math.floor(waitMs * (Math.random()*0.5 - 0.25));
-        await sleep(waitMs + jitter);
-        continue;
-      }
-
-      // For other non-2xx, only retry on the first 1–2 attempts
-      if (attempt < Math.min(3, tries)){
-        const waitMs = baseDelayMs * Math.pow(2, attempt - 1);
-        await sleep(waitMs);
-        continue;
-      }
-
-      // Give up with a clear error
-      throw new Error(`HTTP ${statusCode} for ${url}`);
-    }
-
-    throw new Error(`Failed to fetch after ${tries} attempts: ${url}`);
-  }
-
-
-  // Tiny CSV parser: header row + simple comma split (works for our seed files)
-  function parseCSV(text){
-    const lines = String(text || '').replace(/\r/g,'').split('\n').filter(l => l.trim().length > 0);
-    if (lines.length === 0) return [];
-    const headers = lines[0].split(',').map(h => h.trim());
-    return lines.slice(1).map(line => {
-      const cols = line.split(','); // NOTE: if you later add commas inside quotes, swap for a proper CSV parser.
-      const obj = {};
-      headers.forEach((h, i) => obj[h] = (cols[i] ?? '').trim());
-      return obj;
-    });
-  }
-
-  // Pipe-separated fields → arrays
-  function splitPipes(v){
-    if (!v) return [];
-    return String(v).split('|').map(s => s.trim()).filter(Boolean);
-  }
-
-  try {
-    // 1) Fetch CSVs (sequentially to avoid rate limits)
-    const speciesCSV  = await getTextWithRetry(`${BASE}/species.csv`);
-    // tiny pause between calls to be extra polite
-    await sleep(1200);
-    const effectsCSV  = await getTextWithRetry(`${BASE}/effects.csv`);
-    await sleep(1200);
-    const bonusesCSV  = await getTextWithRetry(`${BASE}/bonuses.csv`);
-    await sleep(1200);
-    const abilitiesCSV= await getTextWithRetry(`${BASE}/abilities.csv`);
-    await sleep(1200);
-    const movesCSV    = await getTextWithRetry(`${BASE}/moves.csv`);
-
-
-    // 2) Parse
-    const speciesRows   = parseCSV(speciesCSV);
-    const effectRows    = parseCSV(effectsCSV);
-    const bonusRows     = parseCSV(bonusesCSV);
-    const abilityRows   = parseCSV(abilitiesCSV);
-    const moveRows      = parseCSV(movesCSV);
-
-    // 3) Normalize columns that are lists
-    speciesRows.forEach(r => {
-      r.biomes = splitPipes(r.biomes);
-      r.types  = splitPipes(r.types);
-    });
-    abilityRows.forEach(r => {
-      r.stack_effects = splitPipes(r.stack_effects);
-      r.stack_bonuses = splitPipes(r.stack_bonuses);
-    });
-    moveRows.forEach(r => {
-      r.stack_effects = splitPipes(r.stack_effects);
-      r.stack_bonuses = splitPipes(r.stack_bonuses);
-    });
-
-    // 4) Upsert into DB tables we already use (mg_species) and cache content for effects/bonuses/moves/abilities
-    //    For now, dump effects/bonuses/moves/abilities into your in-memory content loader if available,
-    //    and refresh the in-process cache so the UI sees them immediately.
-    //    If you already have a contentLoader with setters, use them. Otherwise store them in a module-level singleton.
-
-    // SPECIES → mg_species
-    // Columns assumed: id,name,base_spawn_rate,biomes(types text[]),types text[], plus base stats
-    // We keep it simple: wipe & insert (safe for your testing); change to upsert if you prefer.
-    await pool.query('BEGIN');
-    await pool.query('DELETE FROM mg_species'); // testing-only reset
-    for (const r of speciesRows) {
-      await pool.query(`
-        INSERT INTO mg_species (
-          id, name, base_spawn_rate, biomes, types,
-          base_hp, base_phy, base_mag, base_def, base_res, base_spd, base_acc, base_eva
-        ) VALUES (
-          $1, $2, $3, $4, $5,
-          $6, $7, $8, $9, $10, $11, $12, $13
-        )
-      `, [
-        Number(r.id)||0,
-        r.name || `Species ${r.id||'?'}`,
-        Number(r.base_spawn_rate)||0.05,
-        r.biomes, // as text[]
-        r.types,  // as text[]
-        Number(r.base_hp)||40,
-        Number(r.base_phy)||10,
-        Number(r.base_mag)||10,
-        Number(r.base_def)||10,
-        Number(r.base_res)||10,
-        Number(r.base_spd)||10,
-        Number(r.base_acc)||95,
-        Number(r.base_eva)||5
-      ]);
-    }
-    await pool.query('COMMIT');
-
-    // EFFECTS / BONUSES / MOVES / ABILITIES → in-memory content
-    // If you have contentLoader.reloadContent reading from remote, you could call it here.
-    // Otherwise, expose them via getContent().
-    const content = {
-      version: Date.now(),
-      effects: effectRows.map(r => ({ ...r, code: String(r.code||'').trim(), desc: r.desc || '' })),
-      bonuses: bonusRows.map(r => ({ ...r, code: String(r.code||'').trim(), desc: r.desc || '' })),
-      abilities: abilityRows.map(r => ({
-        ...r,
-        code: String(r.code||'').trim(),
-        name: r.name || String(r.code||'').trim(),
-        stack_effects: r.stack_effects,
-        stack_bonuses: r.stack_bonuses
-      })),
-      named_moves: moveRows.map(r => ({
-        ...r,
-        code: String(r.code||'').trim(),
-        name: r.name || '',
-        stack_effects: r.stack_effects,
-        stack_bonuses: r.stack_bonuses
-      })),
-      pool: {
-        effects: effectRows.map(r => String(r.code||'').trim()).filter(Boolean),
-        bonuses: bonusRows.map(r => String(r.code||'').trim()).filter(Boolean)
-      }
-    };
-
-    // If you have a setter in contentLoader, use it; else store on a module var.
-    //try {
-      // Prefer: contentLoader.setContent(content)
-    //  if (typeof global.__MG_CONTENT === 'object') {
-    //    global.__MG_CONTENT = content;
-    //  } else {
-    //    global.__MG_CONTENT = content;
-    //  }
-    //} catch(_) {
-    //  global.__MG_CONTENT = content;
-    //}
-    
-    // Publish imported content immediately in-process
-    OVERRIDE_CONTENT = content;
-
-    // Respond with counts
-    return res.json({
-      ok: true,
-      imported: {
-        species: speciesRows.length|0,
-        effects: effectRows.length|0,
-        bonuses: bonusRows.length|0,
-        abilities: abilityRows.length|0,
-        moves: moveRows.length|0
-      }
-    });
-
-  } catch (e) {
-    const reason = String(e && e.message ? e.message : e);
-    console.error('Import error:', e && e.stack ? e.stack : e);
-    // Put the human-readable reason in `message` so the client shows it
-    return res.status(500).json({
-      ok: false,
-      error: 'server_error',
-      message: reason,
-      details: reason
-    });
-  }
-
-});
-
 /* -------- Admin: DB-backed Content CRUD (effects/bonuses/moves_named/abilities) -------- */
 // TEMP admin guard: only allow player_id === 1
 function adminGuard(req, res) {
@@ -1516,7 +1265,7 @@ const CONTENT_TABLES = {
 
 
 
-// GET list (with simple pagination later if needed)
+// GET list of all records in a particular table (for the content editor) (with simple pagination later if needed)
 app.get('/api/admin/db/:kind', auth, async (req, res) => {
   if (!adminGuard(req, res)) return;
   const kind = String(req.params.kind || '').toLowerCase();
@@ -1699,7 +1448,7 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
   }
 });
 
-// DELETE by id
+// DELETE a record from a database table by id
 app.delete('/api/admin/db/:kind/:id', auth, async (req, res) => {
   if (!adminGuard(req, res)) return;
   const kind = String(req.params.kind || '').toLowerCase();
@@ -1733,6 +1482,7 @@ function getWorldChunk(cx, cy){
   const tiles = Array.from({length:h},()=>Array.from({length:w},()=>({ biome:'grassland' })));
   return { w,h,tiles };
 }
+
 function chunkHandler(req,res){
   try{
     const cx = parseInt(req.query.x,10)|0;
@@ -1805,17 +1555,21 @@ async function getBattleStats(side, b){
   }
 }
 
-
+//work out which monster in the player's party is the first not fainted
 function firstAliveIndex(party){
   for (let i=0;i<party.length;i++) if ((party[i].hp|0)>0) return i;
   return -1;
 }
+
+//return a list of all mosters in the party not fainted
 function aliveIndices(party){
   const out=[]; for (let i=0;i<party.length;i++) if ((party[i].hp|0)>0) out.push(i);
   return out;
 }
 
 // --- Damage helpers (PHY/MAG vs DEF/RES) ---
+
+//Work out is a move's damage is physical or magical
 function moveKind(move){
   const base = (move?.base||'').toLowerCase();
   const stack = Array.isArray(move?.stack) ? move.stack.map(s=>String(s).toLowerCase()) : [];
@@ -1826,6 +1580,7 @@ function moveKind(move){
   return 'physical';
 }
 
+//return the current stats for a specific player monster
 async function getMonDerivedStats(mon){
   // mon must have species_id, level, growth
   const srow = await getSpeciesRow(mon.species_id);
@@ -1841,6 +1596,7 @@ async function getEnemyDerivedStats(enemy){
   return deriveStats(srow, neutral, enemy.level|0);
 }
 
+// Return the amount of damage an attack does
 async function calcDamage(attackerStats, defenderStats, move, attackerLevel){
   const kind = moveKind(move);
   if (kind === 'status') return 0;
@@ -1930,13 +1686,17 @@ async function awardXP(ownerId, mon, enemyLevel){
   return { updated: rows[0], gain, msgs };
 }
 
+//return a map of the supplied moves with their ?current? PP 
 function makePPMap(moves){
   const map={}; (moves||[]).slice(0,4).forEach(m=>{ map[m.name]= (m.pp|0) || 20; }); return map;
 }
 
+//create a monster from scratch when an encounter is triggered
 async function buildEnemyFromTile(tile){
   // pick species weighted by base_spawn_rate
   const { rows: speciesRows } = await pool.query(`SELECT id,name,base_spawn_rate FROM mg_species ORDER BY id ASC`);
+  
+  //if the list of potential species is empty, use this fallback
   if (!speciesRows.length){
     const { id: fallbackId, name: fallbackName } = await ensureMoveRecord(['dmg_phys'], []);
     const maxPP = await getMaxPPForStack(['dmg_phys'], 25);
@@ -1946,15 +1706,21 @@ async function buildEnemyFromTile(tile){
       moves: [{ move_id: fallbackId, current_pp: maxPP, name_custom: fallbackName }]
     };
   }
+
+  //for each species in the potential list, give a weight
   const weights = speciesRows.map(r => Math.max(0.01, Number(r.base_spawn_rate)||0.05));
+
+  //work out the total of all the wieghts
   const total   = weights.reduce((a,b)=>a+b,0);
+
+  //random number between 0 and total, and use that to pick the species
   let t = Math.random()*total, pick = speciesRows[0];
   for (let i=0;i<weights.length;i++){ if ((t -= weights[i]) <= 0){ pick = speciesRows[i]; break; } }
 
-  // level: keep your 2..4
+  // set the starting level of the monster. For now, this is just a random number between 2 and 5
   const level = 2 + Math.floor(Math.random()*3);
 
-  // stats: keep your existing curve/derivation
+  // set the monsters base and derived (levelled-up) stats. Levelled-up stat calculation needs to be revisited
   const srow    = await getSpeciesRow(pick.id);
   const neutral = { HP:1, PHY:1, MAG:1, DEF:1, RES:1, SPD:1, ACC:1, EVA:1 };
   const derived = srow ? deriveStats(srow, neutral, level) : { HP: 16 + level*4 };
@@ -2027,23 +1793,36 @@ async function buildEnemyFromTile(tile){
   return { speciesId: pick.id, name: pick.name, level, hp, max_hp: hp, moves };
 }
 
+//api call to attrt a new battle
 app.post('/api/battle/start', auth, async (req,res)=>{
   try{
     // proactively discard any old battle:
     if (battles.has(req.session.token)) battles.delete(req.session.token);
     
+    //get and hold the party details
     const party = await getParty(req.session.player_id);
+
+    //get the first non-fainted party member. If none, end battle
     const idx = firstAliveIndex(party);
     if (idx<0) return res.status(409).json({ error:'you_fainted' });
 
+    //work out where in the world the player is
     const st = await getState(req.session.player_id);
     const tile = (getWorldChunk(st.cx, st.cy)?.tiles?.[st.ty]||[])[st.tx];
 
+    //create an appropriate enemy for the tile the player is on
     const enemy = await buildEnemyFromTile(tile);
+
+    //create an object (you) that is the first active monster in player party
     const you = { ...party[idx] };
+
+    //for the current monster's moves, work out max ppl
     await attachPPToMoves(you);
+
+    //also get the current pp
     const pp = await getCurrentPP(you);
     
+    //battle is the return object, containing the important state information for each step of the battle
     const battle = {
       you, enemy, youIndex: idx, pp,
       log:[`A wild ${enemy.name} appears!`],
@@ -2051,6 +1830,7 @@ app.post('/api/battle/start', auth, async (req,res)=>{
       requireSwitch:false
     };
 
+    //add battle to the battles list
     battles.set(req.session.token, battle);
 
     res.json({
@@ -2350,6 +2130,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
 
 app.post('/api/battle/capture', auth, async (req,res)=>{
   try{
+    // hold the details of the current battle, or return an error if it doesn't exist or if catpture isn't allowed
     const b = battles.get(req.session.token);
     if (!b) return res.status(404).json({ error:'no_battle' });
     if (!b.allowCapture) return res.status(409).json({ error:'not_allowed' });
@@ -2362,13 +2143,14 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     }
 
     // Preserve enemy moves; if none, create a minimal DB-backed move entry
-    const fallbackRec = await ensureMoveRecord(['dmg_phys'], []);
-    const fallbackPP  = await getMaxPPForStack(['dmg_phys'], 25);
+    const fallbackRec = await ensureMoveRecord(['PhysicalDamage'], []);
+    const fallbackPP  = await getMaxPPForStack(['PhysicalDamage'], 25);
     const moves = Array.isArray(b.enemy.moves) && b.enemy.moves.length
       ? b.enemy.moves
       : [{ move_id: fallbackRec.id, current_pp: fallbackPP, name_custom: fallbackRec.name }];
 
-    // Compute growth and derived HP for the captured species/level
+    // Compute growth and derived HP for the captured species/level (should this really be done here?)
+    // I think this should be done when monster is created, and persist
     const capSpeciesId = b.enemy.speciesId|0;
     const capLevel     = b.enemy.level|0;
     const capSrow      = await getSpeciesRow(capSpeciesId);
@@ -2376,9 +2158,10 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     const capDerived   = capSrow ? deriveStats(capSrow, capGrowth, capLevel)
                                  : { HP: Math.max(12, b.enemy.max_hp|0) };
 
+    //insert the new mon into the db monsters table. ### need to add abilities
     await pool.query(`
       INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,growth)
-      VALUES ($1,$2,$3,0,$4,$4,'wild',$5,$6)
+      VALUES ($1,$2,$3,0,$4,$4,'',$5,$6)
     `, [
       req.session.player_id,
       capSpeciesId,
