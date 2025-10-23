@@ -1002,7 +1002,7 @@ app.post('/api/login', async (req,res)=>{
 });
 app.get('/api/session', auth, async (req,res)=>{
   await ensureHasParty(req.session.player_id);
-  await ensureStarterMoves(req.session.player_id);
+  //await ensureStarterMoves(req.session.player_id);
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   res.json({ token: req.session.token, player: { handle:req.session.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
