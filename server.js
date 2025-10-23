@@ -1220,9 +1220,9 @@ app.get('/api/moves', async (req, res) => {
     }
 
     // Fetch the moves. Add/adjust columns as you need downstream.
-    const { rows } = await pool.query(
+    const { rows } = await pool.query( //, target, accuracy_base, cost, duration, base_flag_eligible, base_pp, tick_source, tick_percent, effect_type, stat, amount
       `
-      SELECT id, name, target, accuracy_base, cost, duration, base_flag_eligible, base_pp, tick_source, tick_percent, effect_type, stat, amount
+      SELECT id, name
       FROM mg_moves
       WHERE id = ANY($1::int[])
       `,
