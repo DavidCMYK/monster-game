@@ -774,6 +774,7 @@ async function ensureStarterMoves(owner_id){
     const hasGuard = moves.some(m => (m.name||'').toLowerCase()==='guard')
   }catch (e) {
     console.log("HasGuard failed");
+
   };
   
   if (!hasGuard){
@@ -1001,7 +1002,7 @@ app.post('/api/login', async (req,res)=>{
 });
 app.get('/api/session', auth, async (req,res)=>{
   await ensureHasParty(req.session.player_id);
-  //await ensureStarterMoves(req.session.player_id);
+  await ensureStarterMoves(req.session.player_id);
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   res.json({ token: req.session.token, player: { handle:req.session.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
@@ -1461,6 +1462,8 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       }
     } else if (kind === 'monsters') {
       console.log(JSON.stringify(body));
+      
+      //set the body object
       const {
         id,
         owner_id,
@@ -1471,7 +1474,7 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         hp,
         max_hp,
         ability,
-        moves,
+        moves = [],
         slot//,
         //growth,
         //current_pp,
@@ -1485,32 +1488,34 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
 
       //create a function (asArray) that takes one input (v) and converts it into an array
       const asArray = v => Array.isArray(v) ? v : String(v||'').split(',').map(s=>s.trim()).filter(Boolean);
-
-      //const biomesArr = asArray(biomes);
-      //const typesArr  = asArray(types);
-
       //create a function that takes one input (v) and converts it to an integer
       const ints = v => Number.isFinite(+v) ? parseInt(v,10) : 0;
+
+      //enforce moves as an array
+      const mov = Array.isArray(moves) ? moves : [];
+
 
       if (id) { //, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
         q = `
           UPDATE mg_monsters SET
-            owner_id=$2, species_id=$3, nickname=$4,level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10, slot=$11 
+            owner_id=$2, species_id=$3, nickname=$4,level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10::jsonb, slot=$11 
           WHERE id=$1
           RETURNING *`;
+        console.log(q);
         params = [ id, owner_id, species_id, nickname,
                    ints(level), ints(xp), ints(hp),
-                   ints(max_hp), ability, moves, ints(slot)//, growth, ints(current_pp), learned_pool, learn_list
+                   ints(max_hp), ability, JSON.stringify(mov), ints(slot)//, growth, ints(current_pp), learned_pool, learn_list
         ];
       } else { //, growth, current_pp, learned_pool, learn_list
         q = `
           INSERT INTO mg_monsters
             (owner_id, species_id, nickname, level, xp, hp, max_hp, ability, moves, slot)
-          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
           RETURNING *`;
+        console.log(q);
         params = [ id, owner_id, species_id, nickname, //,$12
                    ints(level), ints(xp), ints(hp),
-                   ints(max_hp), ability, moves,ints(slot)//, growth, ints(current_pp), learned_pool, learn_list 
+                   ints(max_hp), ability, JSON.stringify(mov),ints(slot)//, growth, ints(current_pp), learned_pool, learn_list 
         ];
       }
     } else {
