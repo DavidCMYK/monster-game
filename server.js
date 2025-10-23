@@ -1198,6 +1198,49 @@ app.post('/api/monster/release', auth, async (req,res)=>{
   }
 });
 
+/* -----------moves-----------*/
+// Batch lookup: /api/moves?ids=1,2,3
+app.get('/api/moves', async (req, res) => {
+  try {
+    const raw = String(req.query.ids || '');
+    // Parse, dedupe, and sanitize ids
+    const ids = [...new Set(
+      raw.split(',')
+         .map(s => parseInt(s, 10))
+         .filter(n => Number.isInteger(n))
+    )];
+
+    if (!ids.length) {
+      return res.json([]); // no ids requested → empty list
+    }
+
+    // (optional) guardrail to avoid abuse
+    if (ids.length > 200) {
+      return res.status(413).json({ error: 'Too many IDs; max 200 per request.' });
+    }
+
+    // Fetch the moves. Add/adjust columns as you need downstream.
+    const { rows } = await pool.query(
+      `
+      SELECT id, name, description, target, accuracy_base, cost, duration, base_flag_eligible, base_pp, tick_source, tick_percent, effect_type, stat, amount
+      FROM mg_moves
+      WHERE id = ANY($1::int[])
+      `,
+      [ids]
+    );
+
+    // Preserve request order
+    const map = new Map(rows.map(r => [r.id, r]));
+    const ordered = ids.map(id => map.get(id)).filter(Boolean);
+
+    return res.json(ordered);
+  } catch (err) {
+    console.error('GET /api/moves error:', err);
+    return res.status(500).json({ error: 'Failed to fetch moves' });
+  }
+});
+
+
 /* ---------- species & chunk ---------- */
 app.get('/api/species', async (_req,res)=>{
   try{
@@ -2280,3 +2323,4 @@ wss.on('connection', ws => { ws.isAlive = true; ws.on('pong', ()=>ws.isAlive = t
 setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate(); ws.isAlive=false; ws.ping(); }); }, 30000);
 
 server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT));
+
