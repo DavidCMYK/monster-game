@@ -1254,13 +1254,16 @@ const CONTENT_TABLES = {
   moves:      { table: 'mg_moves_named', pk: 'id',     writable: true  },
   abilities:  { table: 'mg_abilities',   pk: 'id',     writable: true  },
   species:    { table: 'mg_species',     pk: 'id',     writable: true  },
+  monsters:       { table: 'mg_monsters',      pk: 'id',     writable: true },
+  moves_canon:    { table: 'mg_moves',         pk: 'id',     writable: true },
+
 
   // Additional tables — view-only (safe)
   players:        { table: 'mg_players',       pk: 'id',     writable: false },
   sessions:       { table: 'mg_sessions',      pk: 'token',  writable: false },
   player_state:   { table: 'mg_player_state',  pk: 'player_id', writable: false },
-  monsters:       { table: 'mg_monsters',      pk: 'id',     writable: false },
-  moves_canon:    { table: 'mg_moves',         pk: 'id',     writable: false },
+  
+  
 };
 
 
@@ -1435,6 +1438,58 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
                    ints(base_hp), ints(base_phy), ints(base_mag),
                    ints(base_def), ints(base_res), ints(base_spd),
                    ints(base_acc), ints(base_eva) ];
+      }
+    } else if (kind === 'monsters') {
+      const {
+        id,
+        owner_id,
+        speciesId,
+        nickname,
+        level,
+        xp,
+        hp,
+        max_hp,
+        ability,
+        moves,
+        slot,
+        growth,
+        current_pp,
+        learned_pool = {"effects":{},"bonuses":{}},
+        learn_list = {"effects":{},"bonuses":{}},
+      } = body;
+
+      if (!id) return res.status(400).json({ error:'missing_fields' });
+
+      //create a function (asArray) that takes one input (v) and converts it into an array
+      const asArray = v => Array.isArray(v) ? v : String(v||'').split(',').map(s=>s.trim()).filter(Boolean);
+
+      //const biomesArr = asArray(biomes);
+      //const typesArr  = asArray(types);
+
+      //create a function that takes one input (v) and converts it to an integer
+      const ints = v => Number.isFinite(+v) ? parseInt(v,10) : 0;
+
+      if (id) {
+        q = `
+          UPDATE mg_monsters SET
+            owner_id=$2, speciesId=$3, nickname=$4,
+            level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10, slot=$11, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
+          WHERE id=$1
+          RETURNING *`;
+        params = [ id, owner_id, speciesId, nickname,
+                   ints(level), ints(xp), ints(hp),
+                   ints(max_hp), ability, moves,
+                   ints(slot), growth, ints(current_pp), learned_pool, learn_list ];
+      } else {
+        q = `
+          INSERT INTO mg_species
+            (owner_id, speciesId, nickname, level, xp, hp, max_hp, ability, moves, slot, growth, current_pp, learned_pool, learn_list)
+          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          RETURNING *`;
+        params = [ id, owner_id, speciesId, nickname,
+                   ints(level), ints(xp), ints(hp),
+                   ints(max_hp), ability, moves,
+                   ints(slot), growth, ints(current_pp), learned_pool, learn_list ];
       }
     } else {
       return res.status(400).json({ error:'bad_kind' });
