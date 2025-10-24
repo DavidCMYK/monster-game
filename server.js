@@ -2001,7 +2001,7 @@ app.post('/api/battle/start', auth, async (req,res)=>{
 });
 
 
-app.post('/api/battle/turn', auth, async (req,res)=>{
+app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chosen an action
   try{
     const b = battles.get(req.session.token);
     if (!b) return res.status(404).json({ error:'no_battle' });
@@ -2114,18 +2114,23 @@ app.post('/api/battle/turn', auth, async (req,res)=>{
       battles.delete(req.session.token);
       return res.json({ log:b.log, result:'escaped' });
     } else if (action === 'move'){
+      //get the move_id of the move selected
       const moveId = Number(req.body.move_id||0)|0;
+      console.log("move ID: "+moveId);
       const yourEntry = (Array.isArray(b.you.moves)?b.you.moves:[]).find(m => (m.move_id|0) === moveId);
       if (!yourEntry) return res.status(400).json({ error:'bad_move' });
-    
+      console.log(yourEntry);
+
       // Load canonical details from DB
       const yourDet = await getMoveDetailsById(yourEntry.move_id);
       if (!yourDet) return res.status(400).json({ error:'move_missing' });
-    
+      console.log(yourDet);
+
       // Compute max PP from the base effect; ensure current_pp is not over cap
       const maxPP = await getMaxPPForStack(yourDet.stack, 25);
       yourEntry.current_pp = Math.min(yourEntry.current_pp|0, maxPP|0);
-    
+      console.log(yourEntry);
+      
       // Visible name = player-defined; if blank, fall back to DB name
       const visibleName = (yourEntry.name_custom && yourEntry.name_custom.trim()) ? yourEntry.name_custom.trim() : yourDet.name;
 
