@@ -153,7 +153,9 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
 
 // --- Per-effect resolver helpers (accuracy & PP from base effect) ---
 function getEffectRowByCode(code){
+  console.log(getEffectRowByCode);
   const c = (OVERRIDE_CONTENT || getContent() || {});
+  console.log(c);
   const list = Array.isArray(c.effects) ? c.effects : [];
   console.log(list);
   const k = String(code || '').trim();
