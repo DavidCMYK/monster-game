@@ -314,6 +314,7 @@ function perEffectAccuracy(effectCode, move, bonuses, isSelfTarget){
 // stat (channel for damage; which stat for stat_change; which status for status), amount (decimal for stat_change)
 async function resolveSingleEffect(effectCode, move, attacker, defender, b){
   const row = getEffectRowByCode(effectCode) || {};
+  console.log(row);
   const targetKey = (String(row.target || 'target').toLowerCase() === 'self') ? 'self' : 'target';
   const effectType = String(row.effect_type || '').toLowerCase();
   const stat = String(row.stat || '').toUpperCase();         // e.g., 'PHY','MAG','DEF','SLEEP'
