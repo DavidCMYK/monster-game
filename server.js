@@ -352,7 +352,21 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
   if (effectType === 'damage'){
     // Determine channel from row.stat: PHY → physical, MAG → special (fallback physical)
     const channel = (stat === 'MAG') ? 'dmg_spec' : 'dmg_phys';
-    const tempMove = { ...move, stack:[channel] };
+
+    // Pull base power from the EFFECT row (amount), else any row.power, else fallback.
+    // You can tune the fallback (8–10 feels good for early game).
+    const effectPower =
+      (row.amount != null ? Number(row.amount) : NaN);
+    const declaredPower =
+      (row.power  != null ? Number(row.power)  : NaN);
+    const fallbackPower = (move.power != null ? Number(move.power) : 1);
+
+    const power = Number.isFinite(effectPower)
+      ? Math.max(1, Math.round(effectPower))
+      : (Number.isFinite(declaredPower) ? Math.max(1, Math.round(declaredPower)) : fallbackPower);
+
+    const tempMove = { ...move, stack:[channel], power };
+
 
     // Use battle-aware stats (includes any prior stat_change effects)
     const atkStats = await getBattleStats(attacker === b.you ? 'you' : 'enemy', b);
@@ -2480,7 +2494,7 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     const moves = Array.isArray(b.enemy.moves) && b.enemy.moves.length
       ? b.enemy.moves
       : [{ move_id: fallbackRec.id, current_pp: fallbackPP, name_custom: fallbackRec.name }];
-      
+
     // Compute growth and derived HP for the captured species/level (should this really be done here?)
     // I think this should be done when monster is created, and persist
     const capSpeciesId = b.enemy.speciesId|0;
