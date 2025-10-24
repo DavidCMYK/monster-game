@@ -2006,20 +2006,24 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
     const b = battles.get(req.session.token);
     if (!b) return res.status(404).json({ error:'no_battle' });
     const action = (req.body?.action||'').toLowerCase();
+    console.log("/api/battle/turn post called");
 
     // If your active fainted this round, you must switch before doing anything else
     if (b.requireSwitch && action !== 'switch'){
+      console.log("Switch required due to active fainted!");
       return res.status(409).json({ error:'must_switch' });
     }
 
     // refresh party entry used for "you" (HP may change between turns due to heal, etc.)
     const party = await getParty(req.session.player_id);
+    console.log(party);
     let you = party[b.youIndex] || party[firstAliveIndex(party)];
     if (!you) return res.status(409).json({ error:'you_team_wiped' });
     b.you = you; // keep latest
+    console.log(b.you);
 
     if (b.allowCapture) return res.status(409).json({ error:'capture_or_finish' });
-
+    console.log(action);
     if (action === 'switch'){
       const party = await getParty(req.session.player_id);
       const targetIdx = Math.max(0, Math.min((req.body.index|0), party.length-1));
@@ -2296,7 +2300,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
     }
 
     res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false });
-  }catch(e){ res.status(500).json({ error:'server_error' }); }
+  }catch(e){ 
+    res.status(500).json({ error:'server_error' }); 
+    console.error("/battle/turn error")
+  }
 });
 
 app.post('/api/battle/capture', auth, async (req,res)=>{
