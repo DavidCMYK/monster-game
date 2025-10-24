@@ -344,9 +344,16 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
   //work out if the effect hits
   const hit = Math.random() < acc;
   if (!hit){
-    b.log.push(`${move.name} (${effectCode}) missed.`);
+    const A = await describeMon(attacker, b);
+    const T = await describeMon(targetMon, b);
+    if (targetKey === 'self'){
+      b.log.push(`${A.poss} ${move.name} missed.`);
+    } else {
+      b.log.push(`${A.poss} ${move.name} missed ${T.cap}.`);
+    }
     return { hit:false, dmg:0 };
   }
+
 
   // --- DAMAGE ---
   if (effectType === 'damage'){
@@ -375,7 +382,10 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
     // calculate damage
     const dmg = await calcDamage(atkStats, defStats, tempMove, attacker.level|0);
     targetMon.hp = Math.max(0, (targetMon.hp|0) - dmg);
-    b.log.push(`${move.name} dealt ${dmg} damage.`);
+    const A = await describeMon(attacker, b);
+    const T = await describeMon(targetMon, b);
+    b.log.push(`${A.poss} ${move.name} dealt ${dmg} damage to ${T.cap}.`);
+
     return { hit:true, dmg };
   }
 
@@ -391,8 +401,15 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
     // row.stat holds which status to apply, e.g., 'SLEEP','STUN','POISON'
     const next = stat ? stat.toLowerCase() : 'status';
     targetMon.status_neg = next;
-    b.log.push(`${move.name} inflicted ${next}.`);
+    const A = await describeMon(attacker, b);
+    const T = await describeMon(targetMon, b);
+    if (targetKey === 'self'){
+      b.log.push(`${A.poss} ${move.name} applied ${next}.`);
+    } else {
+      b.log.push(`${A.poss} ${move.name} inflicted ${next} on ${T.cap}.`);
+    }
     return { hit:true, dmg:0 };
+
   }
 
   // --- STAT CHANGE ---
@@ -403,14 +420,29 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
 
     // accepted stats: HP/PHY/MAG/DEF/RES/SPD/ACC/EVA (ignore others gracefully)
     const allowed = ['HP','PHY','MAG','DEF','RES','SPD','ACC','EVA'];
+    const A = await describeMon(attacker, b);
+    const T = await describeMon(targetMon, b);
+
     if (allowed.includes(stat) && typeof amt === 'number' && amt !== 0){
       bucket[stat] = Number(bucket[stat] || 0) + amt; // stackable
-      const sign = amt > 0 ? '+' : '';
-      b.log.push(`${move.name} ${targetKey === 'self' ? 'raised' : 'changed'} ${stat} by ${sign}${Math.round(amt*100)}%.`);
+      const pct = Math.round(Math.abs(amt)*100);
+      const verb = amt > 0 ? 'raised' : 'lowered';
+
+      if (targetKey === 'self'){
+        b.log.push(`${A.poss} ${move.name} ${verb} ${A.pronoun} ${stat} by ${pct}%.`);
+      } else {
+        b.log.push(`${A.poss} ${move.name} ${verb} ${T.cap}'s ${stat} by ${pct}%.`);
+      }
     } else {
-      b.log.push(`${move.name} applied a stat change (ignored: unknown stat or amount).`);
+      // unknown stat/amount – still say something but keep it tidy
+      if (targetKey === 'self'){
+        b.log.push(`${A.poss} ${move.name} had no noticeable effect.`);
+      } else {
+        b.log.push(`${A.poss} ${move.name} had no noticeable effect on ${T.cap}.`);
+      }
     }
     return { hit:true, dmg:0 };
+
   }
 
   // fallback: unknown type → just log
@@ -433,11 +465,17 @@ async function resolveMoveStackFor(attacker, defender, moveDet, visibleName, b, 
       const tempMove = { name: visibleName, base:'physical', power:fallbackPower, accuracy:fallbackAcc, stack:['dmg_phys'], bonuses:[] };
       const dmg = await calcDamage(atkStats, defStats, tempMove, attacker.level|0);
       defender.hp = Math.max(0, (defender.hp|0) - dmg);
-      b.log.push(`${visibleName} hits for ${dmg}!`);
+      const A = await describeMon(attacker, b);
+      const T = await describeMon(defender, b);
+      b.log.push(`${A.poss} ${visibleName} dealt ${dmg} damage to ${T.cap}.`);
       return { usedFallback:true, totalDamage:dmg };
+
     } else {
-      b.log.push(`${visibleName} missed!`);
+      const A = await describeMon(attacker, b);
+      const T = await describeMon(defender, b);
+      b.log.push(`${A.poss} ${visibleName} missed ${T.cap}.`);
       return { usedFallback:true, totalDamage:0, missed:true };
+
     }
   }
 
@@ -939,6 +977,20 @@ async function monName(mon){
   if (nick) return nick;
   return await speciesNameById(mon.species_id);
 }
+
+// Returns labels and forms to log monsters nicely.
+async function describeMon(mon, b){
+  const label = (mon === b.you) ? 'Your' : 'Wild';
+  const name = await monName(mon);
+  return {
+    label,                      // "Your" | "Wild"
+    name,                       // nickname or species
+    cap: `${label} ${name}`,    // "Your Fieldling"
+    poss: `${label} ${name}'s`, // "Your Fieldling's"
+    pronoun: 'its'              // possessive pronoun for self-targets
+  };
+}
+
 
 
 /* ---------- learning: seen-traits list + learned pool ---------- */
