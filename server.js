@@ -10,6 +10,82 @@ const { Pool } = require('pg');
 const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
+/* ------------------- DELETE THIS --------------------------*/
+
+async function runOneTimeMoveMigration(pool){
+  const MIG_KEY = '2025-10-24-migrate-mg_moves-to-named';
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS meta_migrations (
+        key text PRIMARY KEY,
+        ran_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+
+    const { rows } = await client.query(`SELECT 1 FROM meta_migrations WHERE key=$1`, [MIG_KEY]);
+    if (rows.length) {
+      await client.query('ROLLBACK');
+      console.log('[migration] already applied.');
+      return;
+    }
+
+    const { rows: hasOld } = await client.query(`
+      SELECT to_regclass('public.mg_moves') AS exists_old
+    `);
+    if (!hasOld[0].exists_old) {
+      console.log('[migration] mg_moves not found; recording as done.');
+      await client.query(`INSERT INTO meta_migrations(key) VALUES ($1)`, [MIG_KEY]);
+      await client.query('COMMIT');
+      return;
+    }
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_indexes
+          WHERE schemaname='public'
+            AND indexname='ux_moves_named_effects_bonuses'
+        ) THEN
+          EXECUTE 'CREATE UNIQUE INDEX ux_moves_named_effects_bonuses
+                     ON mg_moves_named ((stack_effects), (stack_bonuses))';
+        END IF;
+      END
+      $$;
+    `);
+
+    const result = await client.query(`
+      INSERT INTO mg_moves_named (name, stack_effects, stack_bonuses)
+      SELECT m.name,
+             to_jsonb(COALESCE(m.stack, '{}'::text[]))::jsonb,
+             to_jsonb(COALESCE(m.bonuses, '{}'::text[]))::jsonb
+      FROM mg_moves m
+      LEFT JOIN mg_moves_named n
+        ON n.stack_effects = to_jsonb(COALESCE(m.stack, '{}'::text[]))::jsonb
+       AND n.stack_bonuses = to_jsonb(COALESCE(m.bonuses, '{}'::text[]))::jsonb
+      WHERE n.name IS NULL;
+    `);
+
+    console.log(`[migration] inserted ${result.rowCount} rows into mg_moves_named.`);
+
+    await client.query(`INSERT INTO meta_migrations(key) VALUES ($1)`, [MIG_KEY]);
+    await client.query('COMMIT');
+    console.log('[migration] done.');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[migration] failed:', e);
+  } finally {
+    client.release();
+  }
+}
+
+/* ---------------------------------------------- END OF DELETE ------------------------------*/
+
 
 // --- Learn-pool helpers ---
 function extractTraitsFromMoves(moves){
@@ -176,24 +252,31 @@ function generatedMoveName(stack, bonuses){
 }
 
 // Ensure there is a row in mg_moves for this exact combo; return {id,name}
-async function ensureMoveRecord(stack, bonuses){
-  const { s, bon } = canonicalizeStackAndBonuses(stack, bonuses);
+//async function ensureMoveRecord(stack, bonuses){
+//  const { s, bon } = canonicalizeStackAndBonuses(stack, bonuses);
 
   // try to find existing
-  const { rows: found } = await pool.query(
-    `SELECT id, name FROM mg_moves WHERE stack=$1::text[] AND bonuses=$2::text[] LIMIT 1`,
-    [ s, bon ]
-  );
-  if (found.length) return { id: found[0].id|0, name: String(found[0].name||'') };
+//  const { rows: found } = await pool.query(
+//    `SELECT id, name FROM mg_moves WHERE stack=$1::text[] AND bonuses=$2::text[] LIMIT 1`,
+//    [ s, bon ]
+//  );
+//  if (found.length) return { id: found[0].id|0, name: String(found[0].name||'') };
 
   // create new with a simple concatenated name
-  const name = generatedMoveName(s, bon);
-  const { rows: ins } = await pool.query(
-    `INSERT INTO mg_moves(name, stack, bonuses) VALUES ($1,$2,$3) RETURNING id, name`,
-    [ name, s, bon ]
-  );
-  return { id: ins[0].id|0, name: String(ins[0].name||name) };
+//  const name = generatedMoveName(s, bon);
+//  const { rows: ins } = await pool.query(
+//    `INSERT INTO mg_moves(name, stack, bonuses) VALUES ($1,$2,$3) RETURNING id, name`,
+//    [ name, s, bon ]
+//  );
+//  return { id: ins[0].id|0, name: String(ins[0].name||name) };
+//}
+
+// Ensure there is a row in mg_moves_named for this exact combo; return {id,name}
+async function ensureMoveRecord(stack, bonuses){
+  const rec = await resolveMoveNameAndPersist(stack, bonuses);
+  return { id: rec.id|0, name: String(rec.name||'') };
 }
+
 
 async function getMaxPPForStack(stack, fallbackPP=20){
   const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
@@ -203,11 +286,29 @@ async function getMaxPPForStack(stack, fallbackPP=20){
   return (pp != null && !Number.isNaN(+pp) && +pp>0) ? (+pp|0) : (fallbackPP|0);
 }
 
+//async function getMoveDetailsById(moveId){
+//  const { rows } = await pool.query(`SELECT id, name, stack, bonuses FROM mg_moves WHERE id=$1 LIMIT 1`, [moveId|0]);
+//  if (!rows.length) return null;
+//  return { id: rows[0].id|0, name: String(rows[0].name||''), stack: rows[0].stack||[], bonuses: rows[0].bonuses||[] };
+//}
+
 async function getMoveDetailsById(moveId){
-  const { rows } = await pool.query(`SELECT id, name, stack, bonuses FROM mg_moves WHERE id=$1 LIMIT 1`, [moveId|0]);
+  const { rows } = await pool.query(
+    `SELECT id, name, stack_effects, stack_bonuses
+       FROM mg_moves_named
+      WHERE id=$1
+      LIMIT 1`,
+    [moveId|0]
+  );
   if (!rows.length) return null;
-  return { id: rows[0].id|0, name: String(rows[0].name||''), stack: rows[0].stack||[], bonuses: rows[0].bonuses||[] };
+  return {
+    id: rows[0].id|0,
+    name: String(rows[0].name||''),
+    stack: Array.isArray(rows[0].stack_effects) ? rows[0].stack_effects : [],
+    bonuses: Array.isArray(rows[0].stack_bonuses) ? rows[0].stack_bonuses : []
+  };
 }
+
 
 async function attachPPToMoves(mon){
   try{
@@ -377,6 +478,11 @@ const pool = new Pool({
   port: Number(PGPORT), ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
   connectionTimeoutMillis: 4000, idleTimeoutMillis: 30000
 });
+
+// --- Run the one-time migration if flag is set ---
+if (String(process.env.RUN_MIGRATION_ON_BOOT || '') === '1') {
+  runOneTimeMoveMigration(pool).catch(err => console.error('[migration] uncaught', err));
+}
 
 const CHUNK_W = 256, CHUNK_H = 256;
 
@@ -1220,14 +1326,12 @@ app.get('/api/moves', async (req, res) => {
     }
 
     // Fetch the moves. Add/adjust columns as you need downstream.
-    const { rows } = await pool.query( //, target, accuracy_base, cost, duration, base_flag_eligible, base_pp, tick_source, tick_percent, effect_type, stat, amount
-      `
+    const { rows } = await pool.query(`
       SELECT id, name
-      FROM mg_moves
+      FROM mg_moves_named
       WHERE id = ANY($1::int[])
-      `,
-      [ids]
-    );
+    `, [ids]);
+
 
     // Preserve request order
     const map = new Map(rows.map(r => [r.id, r]));
@@ -2323,4 +2427,3 @@ wss.on('connection', ws => { ws.isAlive = true; ws.on('pong', ()=>ws.isAlive = t
 setInterval(()=>{ wss.clients.forEach(ws=>{ if (!ws.isAlive) return ws.terminate(); ws.isAlive=false; ws.ping(); }); }, 30000);
 
 server.listen(PORT, ()=>console.log('Monster game server listening on :' + PORT));
-
