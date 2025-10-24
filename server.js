@@ -972,11 +972,21 @@ async function speciesNameById(id){
   const { rows } = await pool.query(`SELECT name FROM mg_species WHERE id=$1 LIMIT 1`, [id|0]);
   return rows[0]?.name || `Species ${id||'?'}`;
 }
+
 async function monName(mon){
-  const nick = (mon?.nickname||'').trim();
+  const nick = (mon?.nickname || '').trim();
   if (nick) return nick;
-  return await speciesNameById(mon.species_id);
+
+  // Enemy/wild often has a plain .name already
+  if (typeof mon?.name === 'string' && mon.name.trim()) return mon.name.trim();
+
+  // Handle both player and enemy shapes
+  const sid = Number(mon?.species_id ?? mon?.speciesId) | 0;
+  if (sid) return await speciesNameById(sid);
+
+  return 'Species ?';
 }
+
 
 // Returns labels and forms to log monsters nicely.
 async function describeMon(mon, b){
@@ -2134,7 +2144,8 @@ async function buildEnemyFromTile(tile){
     if (!m.name_custom || !m.name_custom.trim()) m.name_custom = rec.name;
   }
 
-  return { speciesId: pick.id, name: pick.name, level, hp, max_hp: hp, moves };
+  return { speciesId: pick.id, species_id: pick.id, name: pick.name, level, hp, max_hp: hp, moves };
+
 }
 
 //api call to attrt a new battle
