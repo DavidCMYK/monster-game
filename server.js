@@ -2234,7 +2234,22 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
       yourEntry.current_pp = Math.max(0, (yourEntry.current_pp|0) - 1);
       console.log(b.you.moves);
       // persist the whole moves array (minimal objects) back to DB
-      await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`, [b.you.moves, b.you.id, req.session.player_id]);
+      //await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`, [b.you.moves, b.you.id, req.session.player_id]);
+      // Build a clean JSON payload for DB storage
+      const movesPayload = (Array.isArray(b.you?.moves) ? b.you.moves : []).map(m => ({
+        move_id: (m?.move_id|0) || 0,
+        current_pp: (m?.current_pp|0) || 0,
+        max_pp: (m?.max_pp|0) || 0,
+        name_custom: String(m?.name_custom ?? '').slice(0,120)
+      }));
+      
+      // Write as JSONB (important: stringify + ::jsonb)
+      await pool.query(
+        `UPDATE mg_monsters
+            SET moves = $1::jsonb
+          WHERE id = $2 AND owner_id = $3`,
+        [ JSON.stringify(movesPayload), b.you.id|0, req.session.player_id|0 ]
+      );
       console.log("pp consumed")
 
       // enemy KO check
