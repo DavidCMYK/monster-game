@@ -1439,10 +1439,11 @@ app.get('/api/moves', async (req, res) => {
 
     // Fetch the moves. Add/adjust columns as you need downstream.
     const { rows } = await pool.query(`
-      SELECT id, name
+      SELECT id, name, stack_effects, stack_bonuses
       FROM mg_moves_named
       WHERE id = ANY($1::int[])
     `, [ids]);
+
 
 
     // Preserve request order
