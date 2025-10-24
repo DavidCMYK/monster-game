@@ -10,81 +10,7 @@ const { Pool } = require('pg');
 const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
-/* ------------------- DELETE THIS --------------------------*/
 
-async function runOneTimeMoveMigration(pool){
-  const MIG_KEY = '2025-10-24-migrate-mg_moves-to-named';
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS meta_migrations (
-        key text PRIMARY KEY,
-        ran_at timestamptz NOT NULL DEFAULT now()
-      );
-    `);
-
-    const { rows } = await client.query(`SELECT 1 FROM meta_migrations WHERE key=$1`, [MIG_KEY]);
-    if (rows.length) {
-      await client.query('ROLLBACK');
-      console.log('[migration] already applied.');
-      return;
-    }
-
-    const { rows: hasOld } = await client.query(`
-      SELECT to_regclass('public.mg_moves') AS exists_old
-    `);
-    if (!hasOld[0].exists_old) {
-      console.log('[migration] mg_moves not found; recording as done.');
-      await client.query(`INSERT INTO meta_migrations(key) VALUES ($1)`, [MIG_KEY]);
-      await client.query('COMMIT');
-      return;
-    }
-
-    await client.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1
-          FROM pg_indexes
-          WHERE schemaname='public'
-            AND indexname='ux_moves_named_effects_bonuses'
-        ) THEN
-          EXECUTE 'CREATE UNIQUE INDEX ux_moves_named_effects_bonuses
-                     ON mg_moves_named ((stack_effects), (stack_bonuses))';
-        END IF;
-      END
-      $$;
-    `);
-
-    const result = await client.query(`
-      INSERT INTO mg_moves_named (name, stack_effects, stack_bonuses)
-      SELECT m.name,
-             to_jsonb(COALESCE(m.stack, '{}'::text[]))::jsonb,
-             to_jsonb(COALESCE(m.bonuses, '{}'::text[]))::jsonb
-      FROM mg_moves m
-      LEFT JOIN mg_moves_named n
-        ON n.stack_effects = to_jsonb(COALESCE(m.stack, '{}'::text[]))::jsonb
-       AND n.stack_bonuses = to_jsonb(COALESCE(m.bonuses, '{}'::text[]))::jsonb
-      WHERE n.name IS NULL;
-    `);
-
-    console.log(`[migration] inserted ${result.rowCount} rows into mg_moves_named.`);
-
-    await client.query(`INSERT INTO meta_migrations(key) VALUES ($1)`, [MIG_KEY]);
-    await client.query('COMMIT');
-    console.log('[migration] done.');
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('[migration] failed:', e);
-  } finally {
-    client.release();
-  }
-}
-
-/* ---------------------------------------------- END OF DELETE ------------------------------*/
 
 
 // --- Learn-pool helpers ---
@@ -479,10 +405,6 @@ const pool = new Pool({
   connectionTimeoutMillis: 4000, idleTimeoutMillis: 30000
 });
 
-// --- Run the one-time migration if flag is set ---
-if (String(process.env.RUN_MIGRATION_ON_BOOT || '') === '1') {
-  runOneTimeMoveMigration(pool).catch(err => console.error('[migration] uncaught', err));
-}
 
 const CHUNK_W = 256, CHUNK_H = 256;
 
@@ -1179,11 +1101,20 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     const prior = moves[idx] || {};
     const newPP = computePPFromBaseEffect(newStack, (prior.pp|0) || 20);
 
-    // --- Ensure DB-stored move name for this exact combo
-    const ensuredName = await ensureMoveRecord(newStack, newBonuses);
+    // --- Ensure DB-stored move name/id for this exact combo
+    const ensured = await ensureMoveRecord(newStack, newBonuses);
 
-    // Merge into move object (overwrite name with canonical)
-    moves[idx] = { ...prior, name: ensuredName, stack:newStack, bonuses:newBonuses, pp:newPP };
+    // Merge; keep move_id, fill name_custom if blank
+    const next = { ...prior, move_id: ensured.id, stack: newStack, bonuses: newBonuses, pp: newPP };
+    // For future UIs that prefer custom label, set it once if empty:
+    if (!next.name_custom || !String(next.name_custom).trim()){
+      next.name_custom = ensured.name;
+    }
+    // Keep legacy 'name' in case any old flows reference it:
+    next.name = ensured.name;
+
+    moves[idx] = next;
+
 
     // Clamp CURRENT PP (do not refill here; refill happens on heal)
     const { rows: curRows } = await pool.query(
