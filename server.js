@@ -2232,9 +2232,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
 
       // consume PP from the monster's own move entry
       yourEntry.current_pp = Math.max(0, (yourEntry.current_pp|0) - 1);
+      console.log(b.you.moves);
       // persist the whole moves array (minimal objects) back to DB
       await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`, [b.you.moves, b.you.id, req.session.player_id]);
-
+      console.log("pp consumed")
 
       // enemy KO check
       if ((b.enemy.hp|0) <= 0){
