@@ -2130,7 +2130,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
       const maxPP = await getMaxPPForStack(yourDet.stack, 25);
       yourEntry.current_pp = Math.min(yourEntry.current_pp|0, maxPP|0);
       console.log(yourEntry);
-      
+
       // Visible name = player-defined; if blank, fall back to DB name
       const visibleName = (yourEntry.name_custom && yourEntry.name_custom.trim()) ? yourEntry.name_custom.trim() : yourDet.name;
 
@@ -2145,6 +2145,8 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
             base:'physical', power:8, accuracy:0.95, stack: eDet.stack, bonuses: eDet.bonuses, priority:0 }
         : { name:'Strike', base:'physical', power:8, accuracy:0.95, stack:['dmg_phys'], bonuses:[], priority:0 };
       const ePri  = 0;
+
+      console.log(eMove);
 
     
       if (ePri > 0){
@@ -2193,9 +2195,11 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
 
       // Resolve each effect in order (from DB), stop early if enemy faints
       const stackList = Array.isArray(yourDet.stack) ? yourDet.stack.map(String) : [];
+      console.log(stackList);
 
       if (stackList.length === 0){
         // Fallback if a move somehow has no stack: simple 95% hit, fixed power
+        console.log("empty stack");
         const fallbackAcc = 0.95;
         if (Math.random() < fallbackAcc){
           const atkStats = await getBattleStats('you', b);
@@ -2209,14 +2213,16 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
           b.log.push(`${visibleName} missed!`);
         }
       } else {
+        // HERE is where Effects are resolved into the move. Check this ###
         const tempMove = { name: visibleName, accuracy: 0.95, bonuses: yourDet.bonuses, stack: yourDet.stack };
-        for (const effectCode of stackList){
+        for (const effectCode of effectCode){
+          console.log("resolve effect: "+effectCode)
           const out = await resolveSingleEffect(effectCode, tempMove, b.you, b.enemy, b);
           // If the enemy fainted at any point, stop further effects
           if ((b.enemy.hp|0) <= 0) break;
         }
       }
-
+      console.log("Effects Resolved");
 
       // consume PP from the monster's own move entry
       yourEntry.current_pp = Math.max(0, (yourEntry.current_pp|0) - 1);
