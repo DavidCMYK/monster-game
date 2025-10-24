@@ -153,13 +153,9 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
 
 // --- Per-effect resolver helpers (accuracy & PP from base effect) ---
 function getEffectRowByCode(code){
-  console.log(getEffectRowByCode);
   const c = (OVERRIDE_CONTENT || getContent() || {});
-  console.log(c);
   const list = Array.isArray(c.effects) ? c.effects : [];
-  console.log(list);
   const k = String(code || '').trim();
-  console.log(k);
   return list.find(e => String(e.code || '').trim() === k) || null;
 }
 
@@ -180,26 +176,6 @@ function generatedMoveName(stack, bonuses){
   const right = (Array.isArray(bonuses)&&bonuses.length) ? ('+' + bonuses.join('+')) : '';
   return (left + right) || 'Custom';
 }
-
-// Ensure there is a row in mg_moves for this exact combo; return {id,name}
-//async function ensureMoveRecord(stack, bonuses){
-//  const { s, bon } = canonicalizeStackAndBonuses(stack, bonuses);
-
-  // try to find existing
-//  const { rows: found } = await pool.query(
-//    `SELECT id, name FROM mg_moves WHERE stack=$1::text[] AND bonuses=$2::text[] LIMIT 1`,
-//    [ s, bon ]
-//  );
-//  if (found.length) return { id: found[0].id|0, name: String(found[0].name||'') };
-
-  // create new with a simple concatenated name
-//  const name = generatedMoveName(s, bon);
-//  const { rows: ins } = await pool.query(
-//    `INSERT INTO mg_moves(name, stack, bonuses) VALUES ($1,$2,$3) RETURNING id, name`,
-//    [ name, s, bon ]
-//  );
-//  return { id: ins[0].id|0, name: String(ins[0].name||name) };
-//}
 
 // Ensure there is a row in mg_moves_named for this exact combo; return {id,name}
 async function ensureMoveRecord(stack, bonuses){
@@ -320,8 +296,7 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
   
   //load the full details of the effect
   const row = getEffectRowByCode(effectCode) || {};
-  console.log(effectCode);
-  console.log(row);
+  
   //work out which monster suffers the consequences of the effect. lower case, and defaults to 'target'
   const targetKey = (String(row.target || 'target').toLowerCase() === 'self') ? 'self' : 'target';
   
@@ -682,22 +657,7 @@ async function initDB(){
 
   await pool.query(`CREATE TABLE IF NOT EXISTS mg_monsters (id SERIAL PRIMARY KEY, owner_id INT NOT NULL REFERENCES mg_players(id) ON DELETE CASCADE, species_id INT NOT NULL REFERENCES mg_species(id), nickname TEXT, level INT NOT NULL DEFAULT 1, xp INT NOT NULL DEFAULT 0, hp INT NOT NULL DEFAULT 20, max_hp INT NOT NULL DEFAULT 20, ability TEXT, moves JSONB DEFAULT '[]'::jsonb);`);
   
-  // Unique canonical moves table (one row per effects/bonuses combination)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS mg_moves (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      stack TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-      bonuses TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-      created_at TIMESTAMPTZ DEFAULT now()
-    );
-  `);
-  
-  // keep name unique per exact stack/bonuses combo using a simple unique index
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS mg_moves_stack_bonuses_uniq
-      ON mg_moves (stack, bonuses);
-  `);
+
 
 
   await pool.query(`ALTER TABLE mg_monsters ADD COLUMN IF NOT EXISTS growth JSONB`);
@@ -1530,7 +1490,6 @@ const CONTENT_TABLES = {
   abilities:  { table: 'mg_abilities',   pk: 'id',     writable: true  },
   species:    { table: 'mg_species',     pk: 'id',     writable: true  },
   monsters:       { table: 'mg_monsters',      pk: 'id',     writable: true },
-  moves_canon:    { table: 'mg_moves',         pk: 'id',     writable: true },
 
 
   // Additional tables — view-only (safe)
