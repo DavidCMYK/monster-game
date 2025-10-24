@@ -317,20 +317,32 @@ function perEffectAccuracy(effectCode, move, bonuses, isSelfTarget){
 // effect resolver using DB fields: target ('target'|'self'), effect_type ('damage'|'status'|'stat_change'),
 // stat (channel for damage; which stat for stat_change; which status for status), amount (decimal for stat_change)
 async function resolveSingleEffect(effectCode, move, attacker, defender, b){
+  
+  //load the full details of the effect
   const row = getEffectRowByCode(effectCode) || {};
+  console.log(effectCode);
   console.log(row);
+  //work out which monster suffers the consequences of the effect. lower case, and defaults to 'target'
   const targetKey = (String(row.target || 'target').toLowerCase() === 'self') ? 'self' : 'target';
+  
+  //get the effect type
   const effectType = String(row.effect_type || '').toLowerCase();
+  
+  //get the stat used, stat affected, or status caused
   const stat = String(row.stat || '').toUpperCase();         // e.g., 'PHY','MAG','DEF','SLEEP'
+  
+  //get the amount (of a stat change, for example)
   const amt  = (row.amount != null) ? Number(row.amount) : null;
 
   // choose who is affected
   const targetMon = (targetKey === 'self') ? attacker : defender;
 
-  // ACC roll (self-target = auto-hit)
+  // ACC roll. it seems that self-targeted effects auto-hit. Change this ###
+  // ### if the base_effect misses, no other effects should be checked
   const acc = perEffectAccuracy(effectCode, move, move?.bonuses, targetKey === 'self');
+  
+  //work out if the effect hits
   const hit = Math.random() < acc;
-
   if (!hit){
     b.log.push(`${move.name} (${effectCode}) missed.`);
     return { hit:false, dmg:0 };
@@ -346,6 +358,7 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
     const atkStats = await getBattleStats(attacker === b.you ? 'you' : 'enemy', b);
     const defStats = await getBattleStats(targetMon === b.you ? 'you' : 'enemy', b);
 
+    // calculate damage
     const dmg = await calcDamage(atkStats, defStats, tempMove, attacker.level|0);
     targetMon.hp = Math.max(0, (targetMon.hp|0) - dmg);
     b.log.push(`${move.name} dealt ${dmg} damage.`);
@@ -653,7 +666,11 @@ async function initDB(){
   }
   await normalizePlayerPositions();
 }
-initDB().then(()=>console.log('✓ DB ready')).catch(e=>{ console.error('DB init failed',e); process.exit(1); });
+//initDB().then(()=>console.log('✓ DB ready')).catch(e=>{ console.error('DB init failed',e); process.exit(1); });
+initDB()
+  .then(()=>console.log('✓ DB ready'))
+  .then(()=>refreshContentCacheFromDB())
+  .catch(e=>{ console.error('DB init failed',e); process.exit(1); });
 
 /* ---------- helpers ---------- */
 function token(){ return 't-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -689,6 +706,56 @@ async function createPlayer(email, handle, password){
 // -------- CSV import helpers + content override --------
 const https = require('https');
 let OVERRIDE_CONTENT = null; // { effects:[], bonuses:[], named_moves:[], pool:{effects:[],bonuses:[]}, version:number }
+
+/** Load effects/bonuses from DB into the in-memory cache used by legacy helpers */
+async function refreshContentCacheFromDB(){
+  try{
+    const effRes = await pool.query(`
+      SELECT code, target, accuracy_base AS accuracy, base_pp,
+             effect_type, stat, amount
+      FROM mg_effects
+      ORDER BY id ASC
+    `);
+    const bonRes = await pool.query(`
+      SELECT code, name, description, target_metric, value_type, value, cost
+      FROM mg_bonuses
+      ORDER BY id ASC
+    `);
+
+    const effects = effRes.rows.map(r => ({
+      code: String(r.code || '').trim(),
+      target: r.target || 'target',
+      accuracy: (r.accuracy == null ? undefined : Number(r.accuracy)),
+      base_pp: (r.base_pp == null ? undefined : Number(r.base_pp)),
+      effect_type: r.effect_type || '',
+      stat: r.stat || '',
+      amount: (r.amount == null ? undefined : Number(r.amount))
+    }));
+    const bonuses = bonRes.rows.map(r => ({
+      code: String(r.code || '').trim(),
+      name: r.name || '',
+      description: r.description || '',
+      target_metric: r.target_metric || '',
+      value_type: r.value_type || 'flat',
+      value: (r.value == null ? undefined : Number(r.value)),
+      cost: (r.cost == null ? undefined : Number(r.cost))
+    }));
+
+    OVERRIDE_CONTENT = {
+      version: Date.now(),
+      effects,
+      bonuses,
+      pool: {
+        effects: effects.map(e => e.code),
+        bonuses: bonuses.map(b => b.code)
+      }
+    };
+    console.log(`[Content] Cache loaded from DB: ${effects.length} effects, ${bonuses.length} bonuses`);
+  }catch(e){
+    console.error('refreshContentCacheFromDB error:', e);
+  }
+}
+
 
 function httpGetText(url){
   return new Promise((resolve,reject)=>{
@@ -1606,7 +1673,14 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
     }
 
     const { rows } = await pool.query(q, params);
+
+    // If content tables changed, refresh the in-memory cache
+    if (['effects','bonuses'].includes(kind)) {
+      try { await refreshContentCacheFromDB(); } catch(_) {}
+    }
+
     return res.json({ ok:true, row: rows[0] });
+
   } catch (e) {
     console.error('admin upsert error', e);
     res.status(500).json({ error:'server_error' });
@@ -1629,6 +1703,11 @@ app.delete('/api/admin/db/:kind/:id', auth, async (req, res) => {
   if (!id) return res.status(400).json({ error: 'bad_id' });
   try {
     await pool.query(`DELETE FROM ${meta.table} WHERE ${meta.pk}=$1`, [id]);
+
+    if (['effects','bonuses'].includes(kind)) {
+      try { await refreshContentCacheFromDB(); } catch(_) {}
+    }
+
     return res.json({ ok:true });
   } catch (e) {
     console.error('admin delete error', e);
@@ -2240,6 +2319,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
       console.log(b.you.moves);
       // persist the whole moves array (minimal objects) back to DB
       //await pool.query(`UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`, [b.you.moves, b.you.id, req.session.player_id]);
+      
       // Build a clean JSON payload for DB storage
       const movesPayload = (Array.isArray(b.you?.moves) ? b.you.moves : []).map(m => ({
         move_id: (m?.move_id|0) || 0,
@@ -2247,7 +2327,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
         max_pp: (m?.max_pp|0) || 0,
         name_custom: String(m?.name_custom ?? '').slice(0,120)
       }));
-      
+
       // Write as JSONB (important: stringify + ::jsonb)
       await pool.query(
         `UPDATE mg_monsters
