@@ -2141,6 +2141,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
       // Use the monster's own current_pp instead of legacy b.pp
       if ((yourEntry.current_pp|0) <= 0) return res.status(400).json({ error:'no_pp' });
 
+      // This is getting the details of the enemy's move. This will need a lot of work. ###
       // --- Enemy priority check (enemy can act BEFORE you) ---
       const eEntry = (Array.isArray(b.enemy.moves) && b.enemy.moves[0]) || null;
       const eDet   = eEntry ? await getMoveDetailsById(eEntry.move_id|0) : null;
@@ -2218,9 +2219,10 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
         }
       } else {
         // HERE is where Effects are resolved into the move. Check this ###
+        console.log("resolve effects");
         const tempMove = { name: visibleName, accuracy: 0.95, bonuses: yourDet.bonuses, stack: yourDet.stack };
-        for (const effectCode of effectCode){
-          console.log("resolve effect: "+effectCode)
+        for (const effectCode of stackList){
+          console.log(effectCode)
           const out = await resolveSingleEffect(effectCode, tempMove, b.you, b.enemy, b);
           // If the enemy fainted at any point, stop further effects
           if ((b.enemy.hp|0) <= 0) break;
