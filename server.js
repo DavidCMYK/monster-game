@@ -121,7 +121,7 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
   // Enforce exactly one base effect
   const baseCodes = stack.filter(code => isBaseEffect(effByCode[code]));
   if (baseCodes.length === 0){
-    return { ok:false, error:'no_base_effect', message:'Your stack must include exactly one base effect (e.g., dmg_phys or dmg_spec).' };
+    return { ok:false, error:'no_base_effect', message:'Your stack must include exactly one base-eligible effect (see mg_effects.base_flag_eligible).' };
   }
   const baseKeep = baseCodes[0];
   const filtered = [];
@@ -404,6 +404,39 @@ async function resolveSingleEffect(effectCode, move, attacker, defender, b){
   return { hit:true, dmg:0 };
 }
 
+// Resolve a whole move (all effects) from attacker → defender.
+// Returns an object describing what happened; DB writes are *not* done here.
+async function resolveMoveStackFor(attacker, defender, moveDet, visibleName, b, opts = {}){
+  const fallbackPower = Number(opts.fallbackPower ?? 8);
+  const fallbackAcc   = Number(moveDet?.accuracy ?? 0.95);
+
+  const stackList = Array.isArray(moveDet?.stack) ? moveDet.stack.map(String) : [];
+  if (stackList.length === 0){
+    // Fallback so "empty" moves still do something (dev-safe)
+    if (Math.random() < fallbackAcc){
+      const atkStats = await getBattleStats(attacker === b.you ? 'you' : 'enemy', b);
+      const defStats = await getBattleStats(defender === b.you ? 'you' : 'enemy', b);
+      const tempMove = { name: visibleName, base:'physical', power:fallbackPower, accuracy:fallbackAcc, stack:['dmg_phys'], bonuses:[] };
+      const dmg = await calcDamage(atkStats, defStats, tempMove, attacker.level|0);
+      defender.hp = Math.max(0, (defender.hp|0) - dmg);
+      b.log.push(`${visibleName} hits for ${dmg}!`);
+      return { usedFallback:true, totalDamage:dmg };
+    } else {
+      b.log.push(`${visibleName} missed!`);
+      return { usedFallback:true, totalDamage:0, missed:true };
+    }
+  }
+
+  // Normal path: effect-by-effect
+  const tempMove = { name: visibleName, accuracy: moveDet.accuracy ?? 0.95, bonuses: moveDet.bonuses, stack: moveDet.stack };
+  let totalDamage = 0;
+  for (const effectCode of stackList){
+    const out = await resolveSingleEffect(effectCode, tempMove, attacker, defender, b);
+    if (out?.dmg) totalDamage += (out.dmg|0);
+    if ((defender.hp|0) <= 0) break; // stop if target fainted
+  }
+  return { usedFallback:false, totalDamage };
+}
 
 
 const app = express();
@@ -1842,6 +1875,7 @@ async function getEnemyDerivedStats(enemy){
 
 // Return the amount of damage an attack does
 async function calcDamage(attackerStats, defenderStats, move, attackerLevel){
+  console.log("calcDamage")
   const kind = moveKind(move);
   if (kind === 'status') return 0;
 
@@ -2137,23 +2171,26 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
 
     
       if (ePri > 0){
-        if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getMonDerivedStats(party[curIdx]);
-          const atkStats = await getEnemyDerivedStats(b.enemy);
-          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
-      
-          const newHp = Math.max(0, (party[curIdx].hp|0) - edmg);
-          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, party[curIdx].id, req.session.player_id]);
-          b.log.push(`${b.enemy.name} (priority) hits for ${edmg}!`);
+        if (eEntry && (eEntry.current_pp|0) <= 0){
+          b.log.push(`${b.enemy.name} hesitates (no PP).`);
         } else {
-          b.log.push(`${b.enemy.name} (priority) missed!`);
+          await resolveMoveStackFor(b.enemy, b.you, eMove, eMove.name, b);
+          if (eEntry){ eEntry.current_pp = Math.max(0, (eEntry.current_pp|0) - 1); }
+
+          // Persist your HP once after enemy finishes acting
+          await pool.query(
+            `UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`,
+            [b.you.hp|0, b.you.id, req.session.player_id]
+          );
         }
+
         const refreshed = await getParty(req.session.player_id);
         if (firstAliveIndex(refreshed) < 0){
           battles.delete(req.session.token);
           return res.json({ log:b.log, result:'you_team_wiped' });
         }
       }
+                                      
     
       b.youIndex = targetIdx;
       b.you = party[targetIdx];
@@ -2161,19 +2198,17 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
       b.log.push(`You switched to ${await monName(b.you)}.`);
     
       if (ePri === 0){
-        if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getBattleStats('you', b);
-          const atkStats = await getBattleStats('enemy', b);
-          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
-
-          const newHp = Math.max(0, (b.you.hp|0) - edmg);
-          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
-          b.you.hp = newHp;
-          b.log.push(`${b.enemy.name} strikes for ${edmg}!`);
+        if (eEntry && (eEntry.current_pp|0) <= 0){
+          b.log.push(`${b.enemy.name} hesitates (no PP).`);
         } else {
-          b.log.push(`${b.enemy.name} missed!`);
+          await resolveMoveStackFor(b.enemy, b.you, eMove, eMove.name, b);
+          if (eEntry){ eEntry.current_pp = Math.max(0, (eEntry.current_pp|0) - 1); }
+          await pool.query(
+            `UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`,
+            [b.you.hp|0, b.you.id, req.session.player_id]
+          );
         }
-    
+
         const refreshed = await getParty(req.session.player_id);
         const idxAlive = firstAliveIndex(refreshed);
         if ((b.you.hp|0) <= 0){
@@ -2184,7 +2219,6 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
               b.pp = await getCurrentPP(b.you);
               b.log.push(`${await monName(refreshed[curIdx])} fainted! ${await monName(b.you)} steps in.`);
             } else {
-              // forced switch next round start
               b.requireSwitch = true;
               b.log.push(`Your monster fainted! Choose a replacement.`);
               return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:true });
@@ -2195,6 +2229,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
           }
         }
       }
+
     
       return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
     } else if (action === 'run'){
@@ -2239,17 +2274,19 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
 
     
       if (ePri > 0){
-        if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getBattleStats('you', b);
-          const atkStats = await getBattleStats('enemy', b);
-          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
-
-          const newHp = Math.max(0, (b.you.hp|0) - edmg);
-          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
-          b.you.hp = newHp;
-          b.log.push(`${b.enemy.name} (priority) hits for ${edmg}!`);
+        if (eEntry && (eEntry.current_pp|0) <= 0){
+          b.log.push(`${b.enemy.name} hesitates (no PP).`);
         } else {
-          b.log.push(`${b.enemy.name} (priority) missed!`);
+          await resolveMoveStackFor(b.enemy, b.you, eMove, eMove.name, b);
+
+          // Enemy PP (kept in-memory, wilds aren’t persisted for PP)
+          if (eEntry){ eEntry.current_pp = Math.max(0, (eEntry.current_pp|0) - 1); }
+
+          // Persist *your* HP once after enemy finishes its action
+          await pool.query(
+            `UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`,
+            [b.you.hp|0, b.you.id, req.session.player_id]
+          );
         }
     
         // If you fainted from priority hit → auto-sub and CANCEL your queued move
@@ -2304,13 +2341,15 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
       } else {
         // HERE is where Effects are resolved into the move. Check this ###
         console.log("resolve effects");
-        const tempMove = { name: visibleName, accuracy: 0.95, bonuses: yourDet.bonuses, stack: yourDet.stack };
-        for (const effectCode of stackList){
-          console.log(effectCode)
-          const out = await resolveSingleEffect(effectCode, tempMove, b.you, b.enemy, b);
+       // const tempMove = { name: visibleName, accuracy: 0.95, bonuses: yourDet.bonuses, stack: yourDet.stack };
+       // for (const effectCode of stackList){
+       //   console.log(effectCode)
+       //   const out = await resolveSingleEffect(effectCode, tempMove, b.you, b.enemy, b);
           // If the enemy fainted at any point, stop further effects
-          if ((b.enemy.hp|0) <= 0) break;
-        }
+       //   if ((b.enemy.hp|0) <= 0) break;
+       // }
+        await resolveMoveStackFor(b.you, b.enemy, yourDet, visibleName, b);
+
       }
       console.log("Effects Resolved");
 
@@ -2361,17 +2400,17 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
 
       // --- Enemy acts AFTER you when no priority ---
       if (ePri === 0){
-        if (Math.random() < (eMove.accuracy ?? 1.0)){
-          const defStats = await getBattleStats('you', b);
-          const atkStats = await getBattleStats('enemy', b);
-          const edmg = await calcDamage(atkStats, defStats, eMove, b.enemy.level|0);
-
-          const newHp = Math.max(0, (b.you.hp|0) - edmg);
-          await pool.query(`UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`, [newHp, b.you.id, req.session.player_id]);
-          b.you.hp = newHp;
-          b.log.push(`${b.enemy.name} strikes back for ${edmg}!`);
+        if (eEntry && (eEntry.current_pp|0) <= 0){
+          b.log.push(`${b.enemy.name} hesitates (no PP).`);
         } else {
-          b.log.push(`${b.enemy.name} missed!`);
+          await resolveMoveStackFor(b.enemy, b.you, eMove, eMove.name, b);
+
+          if (eEntry){ eEntry.current_pp = Math.max(0, (eEntry.current_pp|0) - 1); }
+
+          await pool.query(
+            `UPDATE mg_monsters SET hp=$1 WHERE id=$2 AND owner_id=$3`,
+            [b.you.hp|0, b.you.id, req.session.player_id]
+          );
         }
     
         // You KO check → auto-sub or wipe
@@ -2393,7 +2432,7 @@ app.post('/api/battle/turn', auth, async (req,res)=>{ //when the player has chos
           b.requireSwitch = true;
           b.log.push(`Your monster fainted! Choose a replacement.`);
           await attachPPToMoves(b.you);
-          return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:false });
+          return res.json({ you:b.you, enemy:b.enemy, youIndex:b.youIndex, pp:b.pp, log:b.log, allowCapture:false, requireSwitch:true });
         }
       }
     
@@ -2424,12 +2463,24 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     }
 
     // Preserve enemy moves; if none, create a minimal DB-backed move entry
-    const fallbackRec = await ensureMoveRecord(['PhysicalDamage'], []);
-    const fallbackPP  = await getMaxPPForStack(['PhysicalDamage'], 25);
+    let fallbackBase = 'dmg_phys';
+    try{
+      const { rows: baseEffRows } = await pool.query(
+        `SELECT code, COALESCE(base_pp,25) AS base_pp
+          FROM mg_effects
+          WHERE COALESCE(base_flag_eligible,false)=true
+          ORDER BY id ASC
+          LIMIT 1`
+      );
+      if (baseEffRows.length) fallbackBase = String(baseEffRows[0].code||fallbackBase).trim() || fallbackBase;
+    }catch(_){ /* keep default */ }
+
+    const fallbackRec = await ensureMoveRecord([fallbackBase], []);
+    const fallbackPP  = await getMaxPPForStack([fallbackBase], 25);
     const moves = Array.isArray(b.enemy.moves) && b.enemy.moves.length
       ? b.enemy.moves
       : [{ move_id: fallbackRec.id, current_pp: fallbackPP, name_custom: fallbackRec.name }];
-
+      
     // Compute growth and derived HP for the captured species/level (should this really be done here?)
     // I think this should be done when monster is created, and persist
     const capSpeciesId = b.enemy.speciesId|0;
