@@ -155,7 +155,9 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
 function getEffectRowByCode(code){
   const c = (OVERRIDE_CONTENT || getContent() || {});
   const list = Array.isArray(c.effects) ? c.effects : [];
+  console.log(list);
   const k = String(code || '').trim();
+  console.log(k);
   return list.find(e => String(e.code || '').trim() === k) || null;
 }
 
