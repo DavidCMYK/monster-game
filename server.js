@@ -236,17 +236,16 @@ async function getMoveDetailsById(moveId){
 async function syncMonsterLearnedFromMoves(monId){
   console.log("syncMonsterLearnedFromMoves");
   if (!monId) return;
-  console.log(monId); //
-  console.log(parseInt(monId));
+  console.log(monId);
+
   const { rows: partyRows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId]);
   console.log("rows");
   console.log(partyRows);
-
+  
   if (!partyRows.length) return;
-
-
-  const mon = rows[0];
   console.log("mon");
+  const { mon } = partyRows[0];
+  
   console.log(mon);
 
   let learnedPool = {};
