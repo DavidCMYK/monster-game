@@ -1232,6 +1232,8 @@ app.post('/api/login', async (req,res)=>{
     // Sync learned_pool from move compositions for all party monsters
     try{
       const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
+      console.log("partyRows");
+      console.log(partyRows);
       for (const r of partyRows){
         
         await syncMonsterLearnedFromMoves(r.id|0);
