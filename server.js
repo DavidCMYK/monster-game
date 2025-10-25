@@ -244,7 +244,7 @@ async function syncMonsterLearnedFromMoves(monId){
   
   if (!partyRows.length) return;
   console.log("mon");
-  const { mon } = partyRows[0];
+  const mon = partyRows?.[0] || null;
   
   console.log(mon);
 
