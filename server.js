@@ -1230,6 +1230,9 @@ app.post('/api/login', async (req,res)=>{
     await ensureHasParty(p.id);
     console.log("api login effects learned from moves");
     // Sync learned_pool from move compositions for all party monsters
+    console.log("player_id");
+    console.log(player_id);
+
     try{
       const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
       console.log("partyRows");
@@ -1238,7 +1241,9 @@ app.post('/api/login', async (req,res)=>{
         
         await syncMonsterLearnedFromMoves(r.id|0);
       }
-    }catch(_){}
+    }catch(err){
+      console.error("failed to get player party");
+    }
 
     const st = await getState(p.id);
     const party = await getParty(p.id);
