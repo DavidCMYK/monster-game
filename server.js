@@ -11,7 +11,25 @@ const world = require('./world');
 const { getContent, reloadContent } = require('./contentLoader');
 
 
+const app = express();
+app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.options('*', cors());
+app.use(bodyParser.json());
 
+/* ---------- ENV ---------- */
+const {
+  PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGPORT = 5432, PGSSLMODE = 'require',
+  PORT = 3001, SKIP_NORMALIZE_ON_BOOT = 'false'
+} = process.env;
+
+const pool = new Pool({
+  host: PGHOST, database: PGDATABASE, user: PGUSER, password: PGPASSWORD,
+  port: Number(PGPORT), ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 4000, idleTimeoutMillis: 30000
+});
+
+
+const CHUNK_W = 256, CHUNK_H = 256;
 
 // --- Learn-pool helpers ---
 function extractTraitsFromMoves(moves){
@@ -218,13 +236,14 @@ async function getMoveDetailsById(moveId){
 async function syncMonsterLearnedFromMoves(monId){
   console.log("syncMonsterLearnedFromMoves");
   if (!monId) return;
+  console.log(monId); //, learned_pool, learn_list, moves
   console.log(parseInt(monId));
   try {
     const { rows } = await pool.query(`SELECT id FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId]);
   }catch(e){
     console.error('Query failed:', e.message, e.stack);
   }
-  console.log("rows");
+    console.log("rows");
   console.log(rows);
   if (!rows.length) return;
 
@@ -526,25 +545,7 @@ async function resolveMoveStackFor(attacker, defender, moveDet, visibleName, b, 
 }
 
 
-const app = express();
-app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
-app.options('*', cors());
-app.use(bodyParser.json());
 
-/* ---------- ENV ---------- */
-const {
-  PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGPORT = 5432, PGSSLMODE = 'require',
-  PORT = 3001, SKIP_NORMALIZE_ON_BOOT = 'false'
-} = process.env;
-
-const pool = new Pool({
-  host: PGHOST, database: PGDATABASE, user: PGUSER, password: PGPASSWORD,
-  port: Number(PGPORT), ssl: PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 4000, idleTimeoutMillis: 30000
-});
-
-
-const CHUNK_W = 256, CHUNK_H = 256;
 
 // --- Content Tables (DB) ----------------------------------------------------
 // We’ll store effects/bonuses/moves_named/abilities directly in Postgres.
