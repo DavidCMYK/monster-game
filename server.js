@@ -216,7 +216,9 @@ async function getMoveDetailsById(moveId){
 }
 
 async function syncMonsterLearnedFromMoves(monId){
+  console.log("syncMonsterLearnedFromMoves");
   if (!monId) return;
+  console.log(monId);
   const { rows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId|0]);
   if (!rows.length) return;
   console.log("rows");
@@ -1239,7 +1241,7 @@ app.post('/api/login', async (req,res)=>{
       console.log("partyRows");
       console.log(partyRows);
       for (const r of partyRows){
-        
+        console.log(r);
         await syncMonsterLearnedFromMoves(r.id|0);
       }
     }catch(err){
