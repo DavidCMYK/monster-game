@@ -1530,7 +1530,7 @@ app.get('/api/effects', async (_req,res)=>{
              stat,
              amount,
              notes
-        FROM mg_species
+        FROM mg_effects
     ORDER BY id ASC`);
     res.json({ effects: rows });
   }catch(e){
