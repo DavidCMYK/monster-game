@@ -1771,11 +1771,11 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         max_hp,
         ability,
         moves = [],
-        slot//,
+        slot,
         //growth,
         //current_pp,
-        //learned_pool = {"effects":{},"bonuses":{}},
-        //learn_list = {"effects":{},"bonuses":{}},
+        learned_pool = {"effects":[],"bonuses":[]},
+        learn_list = {"effects":[],"bonuses":[]}
       } = body;
 
       console.log(moves);
@@ -1800,18 +1800,18 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
         console.log(q);
         params = [ id, owner_id, species_id, nickname,
                    ints(level), ints(xp), ints(hp),
-                   ints(max_hp), ability, JSON.stringify(mov), ints(slot)//, growth, ints(current_pp), learned_pool, learn_list
+                   ints(max_hp), ability, JSON.stringify(mov), ints(slot), learned_pool, learn_list//, growth, ints(current_pp)
         ];
       } else { //, growth, current_pp, learned_pool, learn_list
         q = `
           INSERT INTO mg_monsters
-            (owner_id, species_id, nickname, level, xp, hp, max_hp, ability, moves, slot)
-          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+            (owner_id, species_id, nickname, level, xp, hp, max_hp, ability, moves, slot, learned_pool, learn_list)
+          VALUES ($2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)
           RETURNING *`;
         console.log(q);
-        params = [ id, owner_id, species_id, nickname, //,$12
+        params = [ id, owner_id, species_id, nickname,
                    ints(level), ints(xp), ints(hp),
-                   ints(max_hp), ability, JSON.stringify(mov),ints(slot)//, growth, ints(current_pp), learned_pool, learn_list 
+                   ints(max_hp), ability, JSON.stringify(mov),ints(slot), learned_pool, learn_list //, growth, ints(current_pp)
         ];
       }
     } else {
