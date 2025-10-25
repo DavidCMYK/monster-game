@@ -238,16 +238,11 @@ async function syncMonsterLearnedFromMoves(monId){
   if (!monId) return;
   console.log(monId); //
   console.log(parseInt(monId));
-  try {
-    const { rows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId]);
-    console.log("rows");
-    console.log(rows);
-  }catch(e){
-    console.error('Query failed:', e.message, e.stack);
-  }
+  const { rows: partyRows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId]);
   console.log("rows");
-  console.log(rows); 
-  if (!rows.length) return;
+  console.log(partyRows);
+
+  if (!partyRows.length) return;
 
 
   const mon = rows[0];
