@@ -219,12 +219,22 @@ async function syncMonsterLearnedFromMoves(monId){
   if (!monId) return;
   const { rows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId|0]);
   if (!rows.length) return;
+  console.log("rows");
+  console.log(rows);
 
   const mon = rows[0];
+  console.log("mon");
+  console.log(mon);
+
   let pool = {};
   let learn = {};
   try{ pool = mon.learned_pool && typeof mon.learned_pool === 'object' ? mon.learned_pool : JSON.parse(mon.learned_pool||'{}'); }catch{ pool={}; }
   try{ learn = mon.learn_list   && typeof mon.learn_list   === 'object' ? mon.learn_list   : JSON.parse(mon.learn_list||'{}'); }catch{ learn={}; }
+  console.log("pool");
+  console.log(pool);
+  console.log("learn");
+  console.log(learn);
+  
   pool.effects = pool.effects || {};
   pool.bonuses = pool.bonuses || {};
   learn.effects = learn.effects || {};
