@@ -960,7 +960,10 @@ async function getParty(player_id){
 
 
 async function ensureHasParty(owner_id){
+  console.log("ensureHasParty");
   const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM mg_monsters WHERE owner_id=$1`, [owner_id]);
+  console.log("rows");
+  console.log(rows);
   if ((rows[0]?.c||0) === 0){
     const starterSpeciesId = 1;
     const starterLevel = 3;
@@ -970,14 +973,15 @@ async function ensureHasParty(owner_id){
     
     await pool.query(`
       INSERT INTO mg_monsters (owner_id,species_id,level,xp,hp,max_hp,ability,moves,growth)
-      VALUES ($1,$2,$3,0,$4,$4,'rescue:blink','[
-        {"name":"Strike","base":"physical","power":8,"accuracy":0.95,"pp":25,"stack":["dmg_phys"]},
-        {"name":"Guard","base":"status","power":0,"accuracy":1.0,"pp":15,"stack":["buff_def"]}
+      VALUES ($1,$2,$3,0,$4,$4,'','[
+        {"name_custom":"Strike","current_pp":25,"move_id":2}
       ]'::jsonb, $5)
     `, [owner_id, starterSpeciesId, starterLevel, Math.max(1, derived.HP|0), JSON.stringify(growth)]);
 
   }
+  console.log("end of ensureHasParty");
 }
+
 async function ensureStarterMoves(owner_id){
   const { rows } = await pool.query(`SELECT id,moves FROM mg_monsters WHERE owner_id=$1 ORDER BY id ASC LIMIT 1`, [owner_id]);
   if (!rows.length) return;
@@ -1245,10 +1249,12 @@ app.post('/api/login', async (req,res)=>{
 
 app.get('/api/session', auth, async (req,res)=>{
   console.log("api/session");
+  console.log(player_id);
   await ensureHasParty(req.session.player_id);
+  
   // Sync learned_pool from move compositions for all party monsters
   try{
-    console.log(player_id);
+    
     const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
     console.log(partyRows);
 
