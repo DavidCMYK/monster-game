@@ -1228,6 +1228,7 @@ app.post('/api/login', async (req,res)=>{
     try{
       const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
       for (const r of partyRows){
+        console.log("api login effects learned from moves");
         await syncMonsterLearnedFromMoves(r.id|0);
       }
     }catch(_){}
@@ -1246,6 +1247,7 @@ app.get('/api/session', auth, async (req,res)=>{
   try{
     const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
     for (const r of partyRows){
+      console.log("api session effects learned from moves");
       await syncMonsterLearnedFromMoves(r.id|0);
     }
   }catch(_){}
@@ -1567,7 +1569,6 @@ app.get('/api/bonuses', async (_req,res)=>{
   }
 });
 
-
 /* ---------- content (effects/bonuses/moves) ---------- */
 app.get('/api/content/pool', auth, (req, res) => {
   const c = OVERRIDE_CONTENT || getContent();
@@ -1848,7 +1849,7 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       const mov = Array.isArray(moves) ? moves : [];
 
 
-      if (id) { //, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
+      if (id) { //, growth=$12, current_pp=$13
         q = `
           UPDATE mg_monsters SET
             owner_id=$2, species_id=$3, nickname=$4,level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10::jsonb, slot=$11, learned_pool=$12, learn_list=$13
@@ -2677,6 +2678,7 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
     //make sure the monster has learned all the effects and bonuses it already knows
     const newId = ins.rows[0]?.id|0;
     if (newId) {
+      console.log("api battle capture effects learned from moves");
       try { await syncMonsterLearnedFromMoves(newId); } catch(_){}
     }
 
