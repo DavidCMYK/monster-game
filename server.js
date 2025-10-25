@@ -1218,6 +1218,7 @@ app.post('/api/register', async (req,res)=>{
     res.json({ token: tok, player: { handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
   }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
+
 app.post('/api/login', async (req,res)=>{
   console.log("api/login");
   try{
@@ -1231,10 +1232,10 @@ app.post('/api/login', async (req,res)=>{
     console.log("api login effects learned from moves");
     // Sync learned_pool from move compositions for all party monsters
     console.log("player_id");
-    console.log(player_id);
+    console.log(p.id);
 
     try{
-      const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
+      const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [p.id]);
       console.log("partyRows");
       console.log(partyRows);
       for (const r of partyRows){
