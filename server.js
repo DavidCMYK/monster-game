@@ -245,7 +245,8 @@ async function syncMonsterLearnedFromMoves(monId){
   }catch(e){
     console.error('Query failed:', e.message, e.stack);
   }
-    
+  console.log("rows");
+  console.log(rows); 
   if (!rows.length) return;
 
 
