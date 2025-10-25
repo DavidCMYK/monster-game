@@ -1538,6 +1538,26 @@ app.get('/api/effects', async (_req,res)=>{
   }
 });
 
+app.get('/api/bonuses', async (_req,res)=>{
+  try{
+    const { rows } = await pool.query(`
+      SELECT id,
+              code,
+             name,
+             description,
+             target_metric,
+             value_type,
+             base_pp,
+             notes
+        FROM mg_bonuses
+    ORDER BY id ASC`);
+    res.json({ bonuses: rows });
+  }catch(e){
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+
 /* ---------- content (effects/bonuses/moves) ---------- */
 app.get('/api/content/pool', auth, (req, res) => {
   const c = OVERRIDE_CONTENT || getContent();
