@@ -1242,12 +1242,16 @@ app.post('/api/login', async (req,res)=>{
     res.status(500).json({ error:'server_error' });
   }
 });
+
 app.get('/api/session', auth, async (req,res)=>{
   console.log("api/session");
   await ensureHasParty(req.session.player_id);
   // Sync learned_pool from move compositions for all party monsters
   try{
+    console.log(player_id);
     const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
+    console.log(partyRows);
+
     for (const r of partyRows){
       console.log("api session effects learned from moves");
       await syncMonsterLearnedFromMoves(r.id|0);
@@ -1258,6 +1262,7 @@ app.get('/api/session', auth, async (req,res)=>{
   const party = await getParty(req.session.player_id);
   res.json({ token: req.session.token, player: { handle:req.session.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
 });
+
 app.post('/api/logout', auth, async (req,res)=>{ await deleteSession(req.session.token); res.json({ ok:true }); });
 
 /* ---------- party & heal ---------- */
