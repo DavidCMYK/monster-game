@@ -1215,6 +1215,7 @@ app.post('/api/register', async (req,res)=>{
   }catch(e){ res.status(500).json({ error:'server_error' }); }
 });
 app.post('/api/login', async (req,res)=>{
+  console.log("api/login");
   try{
     const { email,password } = req.body||{};
     const p = await getPlayerByEmail(email);
@@ -1223,12 +1224,12 @@ app.post('/api/login', async (req,res)=>{
     if (!ok) return res.status(401).json({ error:'Invalid credentials' });
     const tok = await createSession(p.id);
     await ensureHasParty(p.id);
-
+    console.log("api login effects learned from moves");
     // Sync learned_pool from move compositions for all party monsters
     try{
       const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
       for (const r of partyRows){
-        console.log("api login effects learned from moves");
+        
         await syncMonsterLearnedFromMoves(r.id|0);
       }
     }catch(_){}
@@ -1242,6 +1243,7 @@ app.post('/api/login', async (req,res)=>{
   }
 });
 app.get('/api/session', auth, async (req,res)=>{
+  console.log("api/session");
   await ensureHasParty(req.session.player_id);
   // Sync learned_pool from move compositions for all party monsters
   try{
