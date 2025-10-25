@@ -236,7 +236,7 @@ async function getMoveDetailsById(moveId){
 async function syncMonsterLearnedFromMoves(monId){
   console.log("syncMonsterLearnedFromMoves");
   if (!monId) return;
-  console.log(monId); //, learned_pool, learn_list, moves
+  console.log(monId); //
   console.log(parseInt(monId));
   try {
     const { rows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId]);
@@ -253,17 +253,17 @@ async function syncMonsterLearnedFromMoves(monId){
   console.log("mon");
   console.log(mon);
 
-  let pool = {};
-  let learn = {};
-  try{ pool = mon.learned_pool && typeof mon.learned_pool === 'object' ? mon.learned_pool : JSON.parse(mon.learned_pool||'{}'); }catch{ pool={}; }
-  try{ learn = mon.learn_list   && typeof mon.learn_list   === 'object' ? mon.learn_list   : JSON.parse(mon.learn_list||'{}'); }catch{ learn={}; }
+  let learnedPool = {};
+  let learnList = {};
+  try{ learnedPool = mon.learned_pool && typeof mon.learned_pool === 'object' ? mon.learned_pool : JSON.parse(mon.learned_pool||'{}'); }catch{ learnedPool={}; }
+  try{ learnList = mon.learn_list   && typeof mon.learn_list   === 'object' ? mon.learn_list   : JSON.parse(mon.learn_list||'{}'); }catch{ learnList={}; }
   console.log("pool");
-  console.log(pool);
+  console.log(learnedPool);
   console.log("learn");
-  console.log(learn);
+  console.log(learnList);
   
-  pool.effects = pool.effects || {};
-  pool.bonuses = pool.bonuses || {};
+  learnedPool.effects = learnedPool.effects || {};
+  learnedPool.bonuses = learnedPool.bonuses || {};
   learn.effects = learn.effects || {};
   learn.bonuses = learn.bonuses || {};
 
@@ -283,16 +283,16 @@ async function syncMonsterLearnedFromMoves(monId){
 
   // Add to learned_pool at 100, remove from learn_list if present
   for (const code of effectCodes){
-    pool.effects[code] = 100;
+    learnedPool.effects[code] = 100;
     if (learn.effects[code] != null) delete learn.effects[code];
   }
   for (const code of bonusCodes){
-    pool.bonuses[code] = 100;
+    learnedPool.bonuses[code] = 100;
     if (learn.bonuses[code] != null) delete learn.bonuses[code];
   }
 
-  await pool.query(`UPDATE mg_monsters SET learned_pool=$1, learn_list=$2 WHERE id=$3`,
-    [JSON.stringify(pool), JSON.stringify(learn), monId|0]);
+  await learnedPool.query(`UPDATE mg_monsters SET learned_pool=$1, learn_list=$2 WHERE id=$3`,
+    [JSON.stringify(learnedPool), JSON.stringify(learn), monId|0]);
 }
 
 
