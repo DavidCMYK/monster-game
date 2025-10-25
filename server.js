@@ -218,11 +218,12 @@ async function getMoveDetailsById(moveId){
 async function syncMonsterLearnedFromMoves(monId){
   console.log("syncMonsterLearnedFromMoves");
   if (!monId) return;
-  console.log(monId);
-  const { rows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId|0]);
-  if (!rows.length) return;
+  console.log(monId); //, learned_pool, learn_list, moves
+  const { rows } = await pool.query(`SELECT id FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId|0]);
   console.log("rows");
   console.log(rows);
+  if (!rows.length) return;
+
 
   const mon = rows[0];
   console.log("mon");
