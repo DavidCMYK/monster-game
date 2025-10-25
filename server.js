@@ -1511,6 +1511,33 @@ app.get('/api/species', async (_req,res)=>{
   }
 });
 
+app.get('/api/effects', async (_req,res)=>{
+  try{
+    const { rows } = await pool.query(`
+      SELECT id,
+              code,
+             name,
+             description,
+             target,
+             accuracy_base,
+             cost,
+             duration,
+             base_flag_eligible,
+             base_pp,
+             tick_source,
+             tick_percent,
+             effect_type,
+             stat,
+             amount,
+             notes
+        FROM mg_species
+    ORDER BY id ASC`);
+    res.json({ effects: rows });
+  }catch(e){
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
 /* ---------- content (effects/bonuses/moves) ---------- */
 app.get('/api/content/pool', auth, (req, res) => {
   const c = OVERRIDE_CONTENT || getContent();
