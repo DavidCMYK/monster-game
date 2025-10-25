@@ -1794,7 +1794,7 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       if (id) { //, growth=$12, current_pp=$13, learned_pool=$14, learn_list=$15
         q = `
           UPDATE mg_monsters SET
-            owner_id=$2, species_id=$3, nickname=$4,level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10::jsonb, slot=$11 
+            owner_id=$2, species_id=$3, nickname=$4,level=$5, xp=$6, hp=$7, max_hp=$8, ability=$9, moves=$10::jsonb, slot=$11, learned_pool=$12, learn_list=$13
           WHERE id=$1
           RETURNING *`;
         console.log(q);
