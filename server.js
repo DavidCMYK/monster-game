@@ -215,6 +215,49 @@ async function getMoveDetailsById(moveId){
   };
 }
 
+async function syncMonsterLearnedFromMoves(monId){
+  if (!monId) return;
+  const { rows } = await pool.query(`SELECT id, learned_pool, learn_list, moves FROM mg_monsters WHERE id=$1 LIMIT 1`, [monId|0]);
+  if (!rows.length) return;
+
+  const mon = rows[0];
+  let pool = {};
+  let learn = {};
+  try{ pool = mon.learned_pool && typeof mon.learned_pool === 'object' ? mon.learned_pool : JSON.parse(mon.learned_pool||'{}'); }catch{ pool={}; }
+  try{ learn = mon.learn_list   && typeof mon.learn_list   === 'object' ? mon.learn_list   : JSON.parse(mon.learn_list||'{}'); }catch{ learn={}; }
+  pool.effects = pool.effects || {};
+  pool.bonuses = pool.bonuses || {};
+  learn.effects = learn.effects || {};
+  learn.bonuses = learn.bonuses || {};
+
+  const moves = Array.isArray(mon.moves) ? mon.moves : [];
+  const effectCodes = new Set();
+  const bonusCodes  = new Set();
+
+  for (const m of moves){
+    const mid = m && m.move_id ? (m.move_id|0) : 0;
+    if (!mid) continue;
+    const det = await getMoveDetailsById(mid);
+    if (!det) continue;
+    // include ALL effects in the move's stack (base + additions) and all bonuses
+    for (const e of (det.stack||[])){ if (e) effectCodes.add(String(e).trim()); }
+    for (const b of (det.bonuses||[])){ if (b) bonusCodes.add(String(b).trim()); }
+  }
+
+  // Add to learned_pool at 100, remove from learn_list if present
+  for (const code of effectCodes){
+    pool.effects[code] = 100;
+    if (learn.effects[code] != null) delete learn.effects[code];
+  }
+  for (const code of bonusCodes){
+    pool.bonuses[code] = 100;
+    if (learn.bonuses[code] != null) delete learn.bonuses[code];
+  }
+
+  await pool.query(`UPDATE mg_monsters SET learned_pool=$1, learn_list=$2 WHERE id=$3`,
+    [JSON.stringify(pool), JSON.stringify(learn), monId|0]);
+}
+
 
 async function attachPPToMoves(mon){
   try{
@@ -559,7 +602,7 @@ async function ensureContentTables() {
   await pool.query(`ALTER TABLE mg_effects  ADD COLUMN IF NOT EXISTS effect_type TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE mg_effects  ADD COLUMN IF NOT EXISTS stat TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE mg_effects  ADD COLUMN IF NOT EXISTS amount NUMERIC(8,2) DEFAULT 0`);
-
+  await pool.query(`ALTER TABLE mg_bonuses ADD COLUMN IF NOT EXISTS base_pp INT DEFAULT 0`);
   await pool.query(`ALTER TABLE mg_bonuses   ADD COLUMN IF NOT EXISTS description  TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS rescue_flag  BOOLEAN DEFAULT FALSE`);
   await pool.query(`ALTER TABLE mg_abilities ADD COLUMN IF NOT EXISTS field_effect TEXT DEFAULT ''`);
@@ -756,13 +799,26 @@ let OVERRIDE_CONTENT = null; // { effects:[], bonuses:[], named_moves:[], pool:{
 async function refreshContentCacheFromDB(){
   try{
     const effRes = await pool.query(`
-      SELECT code, target, accuracy_base AS accuracy, base_pp,
-             effect_type, stat, amount
+      SELECT code, 
+        target, 
+        accuracy_base AS accuracy, 
+        base_pp,
+        effect_type, 
+        stat, 
+        amount
+        COALESCE(base_flag_eligible,false) AS base_flag_eligible
       FROM mg_effects
       ORDER BY id ASC
     `);
     const bonRes = await pool.query(`
-      SELECT code, name, description, target_metric, value_type, value, cost
+      SELECT code, 
+        name, 
+        description, 
+        target_metric, 
+        value_type, 
+        value, 
+        cost,
+        base_pp
       FROM mg_bonuses
       ORDER BY id ASC
     `);
@@ -774,7 +830,8 @@ async function refreshContentCacheFromDB(){
       base_pp: (r.base_pp == null ? undefined : Number(r.base_pp)),
       effect_type: r.effect_type || '',
       stat: r.stat || '',
-      amount: (r.amount == null ? undefined : Number(r.amount))
+      amount: (r.amount == null ? undefined : Number(r.amount)),
+      base_flag_eligible: !!r.base_flag_eligible
     }));
     const bonuses = bonRes.rows.map(r => ({
       code: String(r.code || '').trim(),
@@ -783,7 +840,8 @@ async function refreshContentCacheFromDB(){
       target_metric: r.target_metric || '',
       value_type: r.value_type || 'flat',
       value: (r.value == null ? undefined : Number(r.value)),
-      cost: (r.cost == null ? undefined : Number(r.cost))
+      cost: (r.cost == null ? undefined : Number(r.cost)),
+      base_pp: (r.base_pp == null ? undefined : Number(r.base_pp))
     }));
 
     OVERRIDE_CONTENT = {
@@ -1149,19 +1207,22 @@ app.post('/api/register', async (req,res)=>{
 app.post('/api/login', async (req,res)=>{
   try{
     const { email,password } = req.body||{};
-    console.log("Get player");
     const p = await getPlayerByEmail(email);
     if (!p) return res.status(401).json({ error:'Invalid credentials' });
     const ok = await bcrypt.compare(password, p.password_hash);
     if (!ok) return res.status(401).json({ error:'Invalid credentials' });
-    console.log("Create session");
     const tok = await createSession(p.id);
-    console.log("Check player has party");
     await ensureHasParty(p.id);
-    //await ensureStarterMoves(p.id);
-    console.log("Get state");
+
+    // Sync learned_pool from move compositions for all party monsters
+    try{
+      const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
+      for (const r of partyRows){
+        await syncMonsterLearnedFromMoves(r.id|0);
+      }
+    }catch(_){}
+
     const st = await getState(p.id);
-    console.log("Get party");
     const party = await getParty(p.id);
     res.json({ token: tok, player: { handle:p.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
   }catch(e){
@@ -1171,7 +1232,14 @@ app.post('/api/login', async (req,res)=>{
 });
 app.get('/api/session', auth, async (req,res)=>{
   await ensureHasParty(req.session.player_id);
-  //await ensureStarterMoves(req.session.player_id);
+  // Sync learned_pool from move compositions for all party monsters
+  try{
+    const { rows: partyRows } = await pool.query(`SELECT id FROM mg_monsters WHERE owner_id=$1 ORDER BY slot ASC`, [player_id]);
+    for (const r of partyRows){
+      await syncMonsterLearnedFromMoves(r.id|0);
+    }
+  }catch(_){}
+
   const st = await getState(req.session.player_id);
   const party = await getParty(req.session.player_id);
   res.json({ token: req.session.token, player: { handle:req.session.handle, cx:st.cx,cy:st.cy,tx:st.tx,ty:st.ty, party } });
@@ -1572,22 +1640,31 @@ app.post('/api/admin/db/:kind', auth, async (req, res) => {
       }
     } else if (kind === 'bonuses') {
       const {
-        id, code, name, description='', target_metric='', value_type='flat', value=0, cost=0, notes=''
+        id, 
+        code, 
+        name, 
+        description='', 
+        target_metric='', 
+        value_type='flat', 
+        value=0, 
+        cost=0, 
+        base_pp=0,
+        notes=''
       } = body;
       if (!code || !name) return res.status(400).json({ error:'missing_fields' });
       if (id) {
         q = `
           UPDATE mg_bonuses SET
-            code=$1, name=$2, description=$3, target_metric=$4, value_type=$5, value=$6, cost=$7, notes=$8
-          WHERE id=$9
+            code=$1, name=$2, description=$3, target_metric=$4, value_type=$5, value=$6, cost=$7, base_pp=$8, notes=$9
+          WHERE id=$10
           RETURNING *`;
-        params = [code, name, description, target_metric, value_type, value, cost, notes, id];
+        params = [code, name, description, target_metric, value_type, value, cost, base_pp, notes, id];
       } else {
         q = `
-          INSERT INTO mg_bonuses (code,name,description,target_metric,value_type,value,cost,notes)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          INSERT INTO mg_bonuses (code,name,description,target_metric,value_type,value,cost,base_pp,notes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
           RETURNING *`;
-        params = [code, name, description, target_metric, value_type, value, cost, notes];
+        params = [code, name, description, target_metric, value_type, value, cost, base_pp, notes];
       }
     } else if (kind === 'moves') {
       const { id, name, stack_effects=[], stack_bonuses=[], notes='' } = body;
@@ -2539,6 +2616,12 @@ app.post('/api/battle/capture', auth, async (req,res)=>{
       JSON.stringify(moves),
       JSON.stringify(capGrowth)
     ]);
+
+    //make sure the monster has learned all the effects and bonuses it already knows
+    const newId = ins.rows[0]?.id|0;
+    if (newId) {
+      try { await syncMonsterLearnedFromMoves(newId); } catch(_){}
+    }
 
     b.log.push(`Captured ${b.enemy.name}!`);
     battles.delete(req.session.token);
