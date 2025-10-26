@@ -201,8 +201,12 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
   }
   console.log("stack");
   console.log(stack);
+  console.log("bonuses");
+  console.log(bonuses);
+  const returnOk = true;
 
-  return { ok:true, stack, bonuses };
+
+  return { ok: returnOk, stack: stack, bonuses: bonuses };
 }
 
 // --- Per-effect resolver helpers (accuracy & PP from base effect) ---
@@ -1412,7 +1416,6 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     if (!result.ok){
       return res.status(400).json({ error: result.error, message: result.message });
     }
-
     
 
     const newStack   = result.stack;
