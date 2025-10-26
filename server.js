@@ -1356,6 +1356,19 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     const { id, index, stack, bonuses } = req.body || {};
     console.log("req.body");
     console.log(req.body);
+
+    console.log("id");
+    console.log(id);
+
+    console.log("index");
+    console.log(index);
+
+    console.log("stack");
+    console.log(stack);
+
+    console.log("bonuses");
+    console.log(bonuses);
+    
     const monId = id|0, idx = index|0;
 console.log("monId");
     console.log(monId);
