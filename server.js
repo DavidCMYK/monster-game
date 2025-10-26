@@ -1378,21 +1378,28 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
 
     // --- Validate & sanitize against database
-    try {
-      const result = validateAndSanitizeStack(stack, bonuses);
-    }catch(err) {
+
+    //const result = validateAndSanitizeStack(stack, bonuses);
+    validateAndSanitizeStack(stack, bonuses)
+    .then(result => {
+
+      console.log('Validation result:', result);
+      sanitizedStack = result
+    })
+    .catch(err => {
       console.error('monster/move error:', err);
-    };
-    
-    console.log("result");
-    console.log(result);
-    if (!result.ok){
-      return res.status(400).json({ error: result.error, message: result.message });
-    }
+    });
+
+  
+  console.log("sanitizedStack");
+  console.log(sanitizedStack);
+  // if (!sanitizedStack.ok){
+  //   return res.status(400).json({ error: result.error, message: result.message });
+  // }
 
 
-    const newStack   = result.stack;
-    const newBonuses = result.bonuses;
+    const newStack   = sanitizedStack.stack;
+    const newBonuses = sanitizedStack.bonuses;
 
     // Recompute MAX PP from base effect (from CSV; fallback to prior or 20)
     const prior = moves[idx] || {};
