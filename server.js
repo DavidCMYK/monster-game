@@ -127,28 +127,15 @@ function _contentIndex(){
 }
 
 async function validateAndSanitizeStack(inputStack, inputBonuses){
-  console.log("validate stack");
-  console.log("inputStack");
-  console.log(inputStack);
-  console.log("inputBonuses");
-  console.log(inputBonuses);
-  
-  //const { effByCode, bonByCode, isBaseEffect } = _contentIndex();
   const { rows: effByCode } = await pool.query(
     `SELECT code, base_flag_eligible FROM mg_effects`,
     []
   );
-  console.log("effByCode");
-  console.log(effByCode);
 
   const { rows: bonByCode } = await pool.query(
     `SELECT code FROM mg_bonuses`,
     []
   );
-  console.log("bonByCode");
-  console.log(bonByCode);
-  // console.log("isBaseEffect");
-  // console.log(isBaseEffect);
 
   const rawStack = Array.isArray(inputStack) ? inputStack.map(x => String(x).trim()) : [];
   
@@ -174,7 +161,6 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
 
 
   // Enforce exactly one base effect
-  //const baseCodes = stack.filter(code => isBaseEffect(effByCode[code]));
   const baseCodes = stack.filter(code =>
     effByCode.some(e => e.code === code && e.base_flag_eligible)
   );
@@ -186,28 +172,32 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
     return { ok:false, error:'not one base effect', message:'Your stack must include exactly one base-eligible effect (see mg_effects.base_flag_eligible).' };
   }
   const baseKeep = baseCodes[0];
+  console.log("baseKeep");
+  console.log(baseKeep);
+
   const filtered = [];
   let basePlaced = false;
-  for (const code of stack){
-    const isBase = isBaseEffect(effByCode[code]);
-    if (isBase){
-      if (basePlaced){
-        // skip any extra base effects
-        continue;
-      }
-      if (code !== baseKeep) continue; // only allow the first-found base
-      filtered.push(code);
-      basePlaced = true;
-    } else {
-      filtered.push(code);
-    }
-  }
+
+  // for (const code of stack){
+  //   const isBase = isBaseEffect(effByCode[code]);
+  //   if (isBase){
+  //     if (basePlaced){
+  //       // skip any extra base effects
+  //       continue;
+  //     }
+  //     if (code !== baseKeep) continue; // only allow the first-found base
+  //     filtered.push(code);
+  //     basePlaced = true;
+  //   } else {
+  //     filtered.push(code);
+  //   }
+  // }
 
   // Guarantee the base is first in the stack (helps downstream resolver)
-  if (filtered[0] !== baseKeep){
-    const withoutBase = filtered.filter(c => c !== baseKeep);
-    filtered.length = 0;
-    filtered.push(baseKeep, ...withoutBase);
+  if (stack[0] !== baseKeep){
+    const withoutBase = stack.filter(c => c !== baseKeep);
+    stack.length = 0;
+    stack.push(baseKeep, ...withoutBase);
   }
 
   return { ok:true, stack: filtered, bonuses };
