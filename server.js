@@ -373,15 +373,22 @@ async function attachPPToMoves(mon){
 }
 
 //calculates the max PP of a move
-function computeMoveMaxPP(stack, fallbackPP=20){
-  // //Get the code of the base effect
-  // const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
-  // if (!baseCode) return fallbackPP|0;
-  // const row = getEffectRowByCode(baseCode);
-  // const csvPP = row && row.base_pp != null ? Number(row.base_pp) : null;
-  // if (csvPP != null && !Number.isNaN(csvPP) && csvPP > 0) return csvPP|0;
-  // return fallbackPP|0;
-  return stack.reduce((total, obj) => total + (obj.base_pp || 0), 0);
+async function computeMoveMaxPP(stack){
+  if (!Array.isArray(stack) || stack.length === 0) return 0;
+  try{
+    const query = `
+      SELECT SUM(base_pp)::int AS total_pp
+      FROM mg_effects
+      WHERE code = ANY($1)
+    `;
+    const values = [stack]; // PostgreSQL array parameter
+    const { rows } = await pool.query(query, values);
+
+    return rows[0].total_pp || 0;
+  }catch(e){
+    res.status(500).json({ error:'server_error' });
+  }
+  //return stack.reduce((total, obj) => total + (obj.base_pp || 0), 0);
 }
 
 
