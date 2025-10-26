@@ -1387,21 +1387,6 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     } catch (err) {
       console.error('monster/move error:', err);
     }
-    // validateAndSanitizeStack(stack, bonuses)
-    // .then(result => {
-    //   console.log('Validation result:', result);
-    //   const sanitizedStack = result;
-    // })
-    // .catch(err => {
-    //   console.error('monster/move error:', err);
-    // });
-
-    console.log("sanitizedStack");
-    console.log(sanitizedStack);
-    // if (!sanitizedStack.ok){
-    //   return res.status(400).json({ error: result.error, message: result.message });
-    // }
-
 
     const newStack   = sanitizedStack.stack;
     const newBonuses = sanitizedStack.bonuses;
@@ -1435,28 +1420,11 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     if (!next.name_custom || !String(next.name_custom).trim()){
       next.name_custom = ensured.name;
     }
-    // Keep legacy 'name' in case any old flows reference it:
-    next.name = ensured.name;
-    console.log("next");
-    console.log(next);
-
+    
     moves[idx] = next;
     console.log("moves");
     console.log(moves);
 
-
-    // Clamp CURRENT PP (do not refill here; refill happens on heal)
-    // const { rows: curRows } = await pool.query(
-    //   `SELECT current_pp FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
-    //   [monId, req.session.player_id]
-    // );
-    // let curMap = curRows[0]?.current_pp;
-    // if (typeof curMap !== 'object' || curMap === null) curMap = {};
-    // const mvName = String(moves[idx]?.name || '');
-    // if (mvName){
-    //   const cur = (curMap[mvName]|0) || 0;
-    //   if (cur > newPP) curMap[mvName] = newPP; // clamp down if needed
-    // }
 
     await pool.query(
       `UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`,
