@@ -126,7 +126,7 @@ function _contentIndex(){
   return { effByCode, bonByCode, isBaseEffect };
 }
 
-function validateAndSanitizeStack(inputStack, inputBonuses){
+async function validateAndSanitizeStack(inputStack, inputBonuses){
   console.log("validate stack");
   console.log("inputStack");
   console.log(inputStack);
