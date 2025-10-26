@@ -1353,24 +1353,24 @@ app.post('/api/party/reorder', auth, async (req,res)=>{
 app.post('/api/monster/move', auth, async (req,res)=>{
   console.log("Post /monster/move");
   try{
-    const { id, index, stack, bonuses } = req.body || {};
+    const { monster_id, move_slot, stack, bonuses } = req.body || {};
     console.log("req.body");
     console.log(req.body);
 
-    console.log("id");
-    console.log(id);
+    console.log("monster_id");
+    console.log(monster_id);
 
-    console.log("index");
-    console.log(index);
+    console.log("move_slot");
+    console.log(move_slot);
 
     console.log("stack");
     console.log(stack);
 
     console.log("bonuses");
     console.log(bonuses);
-    
-    const monId = id|0, idx = index|0;
-console.log("monId");
+
+    const monId = monster_id|0, idx = move_slot|0;
+    console.log("monId");
     console.log(monId);
 
     const { rows } = await pool.query(
