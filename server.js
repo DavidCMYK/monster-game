@@ -279,15 +279,15 @@ async function syncMonsterLearnedFromMoves(monId){
   // Add to learned_pool at 100, remove from learn_list if present
   for (const code of effectCodes){
     learnedPool.effects[code] = 100;
-    if (learn.effects[code] != null) delete learn.effects[code];
+    if (learnList.effects[code] != null) delete learnList.effects[code];
   }
   for (const code of bonusCodes){
     learnedPool.bonuses[code] = 100;
-    if (learn.bonuses[code] != null) delete learn.bonuses[code];
+    if (learnList.bonuses[code] != null) delete learnList.bonuses[code];
   }
 
   await learnedPool.query(`UPDATE mg_monsters SET learned_pool=$1, learn_list=$2 WHERE id=$3`,
-    [JSON.stringify(learnedPool), JSON.stringify(learn), monId|0]);
+    [JSON.stringify(learnedPool), JSON.stringify(learnList), monId|0]);
 }
 
 
