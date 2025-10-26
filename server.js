@@ -1376,27 +1376,18 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     console.log(moves);
 
     if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
-    const sanitizedStack = {};
+    
     // --- Validate & sanitize against database
-
-    //const result = validateAndSanitizeStack(stack, bonuses);
-    validateAndSanitizeStack(stack, bonuses)
-    .then(result => {
-
+    let sanitizedStack;
+    try {
+      sanitizedStack = await validateAndSanitizeStack(stack, bonuses);
       console.log('Validation result:', result);
-      sanitizedStack = result
-    })
-    .catch(err => {
+    } catch (err) {
       console.error('monster/move error:', err);
-    });
-
+    }
   
-  console.log("sanitizedStack");
-  console.log(sanitizedStack);
-  // if (!sanitizedStack.ok){
-  //   return res.status(400).json({ error: result.error, message: result.message });
-  // }
-
+    console.log("sanitizedStack");
+    console.log(sanitizedStack);
 
     const newStack   = sanitizedStack.stack;
     const newBonuses = sanitizedStack.bonuses;
