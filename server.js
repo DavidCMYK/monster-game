@@ -296,16 +296,20 @@ async function syncMonsterLearnedFromMoves(monId){
   console.log(effectCodes);
   console.log("bonusCodes");
   console.log(bonusCodes);
-
+  
   // Add to learned_pool at 100, remove from learn_list if present
   for (const code of effectCodes){
     //learnedPool.effects[code] = 100;
-    if (learnedPool.effects[code] == null) { learnedPool.effects.push(code) };
+    if (!learnedPool.effects.includes(code)) {
+      learnedPool.effects.push(code);
+    }                           
     if (learnList.effects[code] != null) delete learnList.effects[code];
   }
   for (const code of bonusCodes){
     //learnedPool.bonuses[code] = 100;
-    if (learnedPool.effects[code] == null) { learnedPool.bonuses.push(code) };
+    if (!learnList.effects.includes(code)) {
+      learnList.effects.push(code);
+    } 
     if (learnList.bonuses[code] != null) delete learnList.bonuses[code];
   }
   console.log("pool");
