@@ -1361,8 +1361,8 @@ console.log("monId");
     console.log(monId);
 
     const { rows } = await pool.query(
-      `SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
-      [monId, req.session.player_id]
+      `SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 LIMIT 1`,
+      [monId]
     );
     if (!rows.length) return res.status(404).json({ error:'not_found' });
 
