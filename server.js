@@ -1381,7 +1381,7 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     let sanitizedStack;
     try {
       sanitizedStack = await validateAndSanitizeStack(stack, bonuses);
-      console.log('Validation result:', result);
+      console.log('Validation result:', sanitizedStack);
     } catch (err) {
       console.error('monster/move error:', err);
     }
