@@ -1404,7 +1404,7 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     console.log(prior);
 
     // Recompute MAX PP for new move
-    const newMaxPP = computeMoveMaxPP(newStack);
+    const newMaxPP = await computeMoveMaxPP(newStack);
     console.log("newMaxPP");
     console.log(newMaxPP);
 
