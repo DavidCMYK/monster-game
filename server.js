@@ -161,7 +161,10 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
   console.log(rawBonus);
 
   // Keep only codes that exist in the CSV-driven pool
-  const stack = rawStack.filter(code => !!effByCode[code]);
+  //const stack = rawStack.filter(code => !!effByCode[code]);
+  const stack = rawStack.filter(code =>
+    effByCode.some(e => e.code === code)
+  );
   console.log("stack");
   console.log(stack);
 
@@ -171,12 +174,16 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
 
 
   // Enforce exactly one base effect
-  const baseCodes = stack.filter(code => isBaseEffect(effByCode[code]));
+  //const baseCodes = stack.filter(code => isBaseEffect(effByCode[code]));
+  const baseCodes = stack.filter(code =>
+    effByCode.some(e => e.code === code && e.base_flag_eligible)
+  );
+
   console.log("baseCodes");
   console.log(baseCodes);
 
-  if (baseCodes.length === 0){
-    return { ok:false, error:'no_base_effect', message:'Your stack must include exactly one base-eligible effect (see mg_effects.base_flag_eligible).' };
+  if (baseCodes.length != 1){
+    return { ok:false, error:'not one base effect', message:'Your stack must include exactly one base-eligible effect (see mg_effects.base_flag_eligible).' };
   }
   const baseKeep = baseCodes[0];
   const filtered = [];
