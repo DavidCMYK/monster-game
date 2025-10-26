@@ -372,14 +372,16 @@ async function attachPPToMoves(mon){
   }
 }
 
-
-function computePPFromBaseEffect(stack, fallbackPP=20){
-  const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
-  if (!baseCode) return fallbackPP|0;
-  const row = getEffectRowByCode(baseCode);
-  const csvPP = row && row.base_pp != null ? Number(row.base_pp) : null;
-  if (csvPP != null && !Number.isNaN(csvPP) && csvPP > 0) return csvPP|0;
-  return fallbackPP|0;
+//calculates the max PP of a move
+function computeMoveMaxPP(stack, fallbackPP=20){
+  // //Get the code of the base effect
+  // const baseCode = Array.isArray(stack) ? String(stack[0]||'').trim() : '';
+  // if (!baseCode) return fallbackPP|0;
+  // const row = getEffectRowByCode(baseCode);
+  // const csvPP = row && row.base_pp != null ? Number(row.base_pp) : null;
+  // if (csvPP != null && !Number.isNaN(csvPP) && csvPP > 0) return csvPP|0;
+  // return fallbackPP|0;
+  return stack.reduce((total, obj) => total + (obj.base_pp || 0), 0);
 }
 
 
@@ -1385,21 +1387,39 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     } catch (err) {
       console.error('monster/move error:', err);
     }
-  
+    // validateAndSanitizeStack(stack, bonuses)
+    // .then(result => {
+    //   console.log('Validation result:', result);
+    //   const sanitizedStack = result;
+    // })
+    // .catch(err => {
+    //   console.error('monster/move error:', err);
+    // });
+
     console.log("sanitizedStack");
     console.log(sanitizedStack);
+    // if (!sanitizedStack.ok){
+    //   return res.status(400).json({ error: result.error, message: result.message });
+    // }
+
 
     const newStack   = sanitizedStack.stack;
     const newBonuses = sanitizedStack.bonuses;
 
-    // Recompute MAX PP from base effect (from CSV; fallback to prior or 20)
+    //Get the previous move details (from monster level)
     const prior = moves[idx] || {};
     console.log("prior");
     console.log(prior);
 
-    const newPP = computePPFromBaseEffect(newStack, (prior.pp|0) || 20);
-    console.log("newPP");
-    console.log(newPP);
+    // Recompute MAX PP for new move
+    const newMaxPP = computeMoveMaxPP(newStack);
+    console.log("newMaxPP");
+    console.log(newMaxPP);
+
+    //New current PP is the lower of the previus current pp, and the new Max PP
+    const newCurrentPP = Math.min(newMaxPP, prior.current_pp);
+    console.log("newCurrentPP");
+    console.log(newCurrentPP);
 
     // --- Ensure DB-stored move name/id for this exact combo
     const ensured = await ensureMoveRecord(newStack, newBonuses);
@@ -1407,7 +1427,7 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     console.log(ensured);
 
     // Merge; keep move_id, fill name_custom if blank
-    const next = { ...prior, move_id: ensured.id, stack: newStack, bonuses: newBonuses, pp: newPP };
+    const next = { ...prior, move_id: ensured.id, current_pp: newCurrentPP };
     // For future UIs that prefer custom label, set it once if empty:
     console.log("next");
     console.log(next);
@@ -1426,21 +1446,21 @@ app.post('/api/monster/move', auth, async (req,res)=>{
 
 
     // Clamp CURRENT PP (do not refill here; refill happens on heal)
-    const { rows: curRows } = await pool.query(
-      `SELECT current_pp FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
-      [monId, req.session.player_id]
-    );
-    let curMap = curRows[0]?.current_pp;
-    if (typeof curMap !== 'object' || curMap === null) curMap = {};
-    const mvName = String(moves[idx]?.name || '');
-    if (mvName){
-      const cur = (curMap[mvName]|0) || 0;
-      if (cur > newPP) curMap[mvName] = newPP; // clamp down if needed
-    }
+    // const { rows: curRows } = await pool.query(
+    //   `SELECT current_pp FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
+    //   [monId, req.session.player_id]
+    // );
+    // let curMap = curRows[0]?.current_pp;
+    // if (typeof curMap !== 'object' || curMap === null) curMap = {};
+    // const mvName = String(moves[idx]?.name || '');
+    // if (mvName){
+    //   const cur = (curMap[mvName]|0) || 0;
+    //   if (cur > newPP) curMap[mvName] = newPP; // clamp down if needed
+    // }
 
     await pool.query(
-      `UPDATE mg_monsters SET moves=$1, current_pp=$2 WHERE id=$3 AND owner_id=$4`,
-      [JSON.stringify(moves), curMap, monId, req.session.player_id]
+      `UPDATE mg_monsters SET moves=$1 WHERE id=$2 AND owner_id=$3`,
+      [JSON.stringify(moves), monId, req.session.player_id]
     );
 
     res.json({ ok:true, moves, sanitized:true });
