@@ -1351,9 +1351,14 @@ app.post('/api/party/reorder', auth, async (req,res)=>{
 
 // update a specific move's stack/bonuses for one monster
 app.post('/api/monster/move', auth, async (req,res)=>{
+  console.log("Post /monster/move");
   try{
     const { id, index, stack, bonuses } = req.body || {};
+    console.log("req.body");
+    console.log(req.body);
     const monId = id|0, idx = index|0;
+console.log("monId");
+    console.log(monId);
 
     const { rows } = await pool.query(
       `SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 AND owner_id=$2 LIMIT 1`,
