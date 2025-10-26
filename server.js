@@ -262,19 +262,40 @@ async function syncMonsterLearnedFromMoves(monId){
   learnList.effects = learnList.effects || {};
   learnList.bonuses = learnList.bonuses || {};
 
+  console.log("pool");
+  console.log(learnedPool);
+  console.log("learn");
+  console.log(learnList);
+
   const moves = Array.isArray(mon.moves) ? mon.moves : [];
+  console.log("moves");
+  console.log(moves);
+
   const effectCodes = new Set();
+  console.log("effectCodes");
+  console.log(effectCodes);
+
   const bonusCodes  = new Set();
+  console.log("bonusCodes");
+  console.log(bonusCodes);
 
   for (const m of moves){
     const mid = m && m.move_id ? (m.move_id|0) : 0;
+    console.log("mid");
+    console.log(mid);
     if (!mid) continue;
     const det = await getMoveDetailsById(mid);
+    console.log("det");
+    console.log(det);
     if (!det) continue;
     // include ALL effects in the move's stack (base + additions) and all bonuses
     for (const e of (det.stack||[])){ if (e) effectCodes.add(String(e).trim()); }
     for (const b of (det.bonuses||[])){ if (b) bonusCodes.add(String(b).trim()); }
   }
+  console.log("effectCodes");
+  console.log(effectCodes);
+  console.log("bonusCodes");
+  console.log(bonusCodes);
 
   // Add to learned_pool at 100, remove from learn_list if present
   for (const code of effectCodes){
@@ -285,7 +306,10 @@ async function syncMonsterLearnedFromMoves(monId){
     learnedPool.bonuses[code] = 100;
     if (learnList.bonuses[code] != null) delete learnList.bonuses[code];
   }
-
+  console.log("pool");
+  console.log(learnedPool);
+  console.log("learn");
+  console.log(learnList);
   await learnedPool.query(`UPDATE mg_monsters SET learned_pool=$1, learn_list=$2 WHERE id=$3`,
     [JSON.stringify(learnedPool), JSON.stringify(learnList), monId|0]);
 }
