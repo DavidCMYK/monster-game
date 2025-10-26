@@ -1390,25 +1390,9 @@ app.post('/api/monster/move', auth, async (req,res)=>{
   console.log("Post /monster/move");
   try{
     const { monster_id, move_slot, stack, bonuses } = req.body || {};
-    console.log("req.body");
-    console.log(req.body);
-
-    console.log("monster_id");
-    console.log(monster_id);
-
-    console.log("move_slot");
-    console.log(move_slot);
-
-    console.log("stack");
-    console.log(stack);
-
-    console.log("bonuses");
-    console.log(bonuses);
 
     const monId = monster_id|0, idx = move_slot|0;
-    console.log("monId");
-    console.log(monId);
-
+    
     const { rows } = await pool.query(
       `SELECT id, owner_id, moves FROM mg_monsters WHERE id=$1 LIMIT 1`,
       [monId]
@@ -1416,34 +1400,54 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     if (!rows.length) return res.status(404).json({ error:'not_found' });
 
     const moves = Array.isArray(rows[0].moves) ? rows[0].moves : [];
+    console.log("moves");
+    console.log(moves);
+
     if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
 
-    // --- Validate & sanitize against CSV content
+    // --- Validate & sanitize against database
     const result = validateAndSanitizeStack(stack, bonuses);
     if (!result.ok){
       return res.status(400).json({ error: result.error, message: result.message });
     }
+
+    console.log("result");
+    console.log(result);
 
     const newStack   = result.stack;
     const newBonuses = result.bonuses;
 
     // Recompute MAX PP from base effect (from CSV; fallback to prior or 20)
     const prior = moves[idx] || {};
+    console.log("prior");
+    console.log(prior);
+
     const newPP = computePPFromBaseEffect(newStack, (prior.pp|0) || 20);
+    console.log("newPP");
+    console.log(newPP);
 
     // --- Ensure DB-stored move name/id for this exact combo
     const ensured = await ensureMoveRecord(newStack, newBonuses);
+    console.log("ensured");
+    console.log(ensured);
 
     // Merge; keep move_id, fill name_custom if blank
     const next = { ...prior, move_id: ensured.id, stack: newStack, bonuses: newBonuses, pp: newPP };
     // For future UIs that prefer custom label, set it once if empty:
+    console.log("next");
+    console.log(next);
+
     if (!next.name_custom || !String(next.name_custom).trim()){
       next.name_custom = ensured.name;
     }
     // Keep legacy 'name' in case any old flows reference it:
     next.name = ensured.name;
+    console.log("next");
+    console.log(next);
 
     moves[idx] = next;
+    console.log("moves");
+    console.log(moves);
 
 
     // Clamp CURRENT PP (do not refill here; refill happens on heal)
