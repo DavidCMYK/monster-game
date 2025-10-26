@@ -133,14 +133,22 @@ function validateAndSanitizeStack(inputStack, inputBonuses){
   console.log("inputBonuses");
   console.log(inputBonuses);
   
-  const { effByCode, bonByCode, isBaseEffect } = _contentIndex();
-
+  //const { effByCode, bonByCode, isBaseEffect } = _contentIndex();
+  const { rows: effByCode } = await pool.query(
+    `SELECT code, base_flag_eligible FROM mg_effects`,
+    []
+  );
   console.log("effByCode");
   console.log(effByCode);
+
+  const { rows: bonByCode } = await pool.query(
+    `SELECT code FROM mg_bonuses`,
+    []
+  );
   console.log("bonByCode");
   console.log(bonByCode);
-  console.log("isBaseEffect");
-  console.log(isBaseEffect);
+  // console.log("isBaseEffect");
+  // console.log(isBaseEffect);
 
   const rawStack = Array.isArray(inputStack) ? inputStack.map(x => String(x).trim()) : [];
   
