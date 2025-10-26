@@ -127,17 +127,46 @@ function _contentIndex(){
 }
 
 function validateAndSanitizeStack(inputStack, inputBonuses){
+  console.log("validate stack");
+  console.log("inputStack");
+  console.log(inputStack);
+  console.log("inputBonuses");
+  console.log(inputBonuses);
+  
   const { effByCode, bonByCode, isBaseEffect } = _contentIndex();
 
+  console.log("effByCode");
+  console.log(effByCode);
+  console.log("bonByCode");
+  console.log(bonByCode);
+  console.log("isBaseEffect");
+  console.log(isBaseEffect);
+
   const rawStack = Array.isArray(inputStack) ? inputStack.map(x => String(x).trim()) : [];
+  
+  console.log("rawStack");
+  console.log(rawStack);
+  
   const rawBonus = Array.isArray(inputBonuses) ? inputBonuses.map(x => String(x).trim()) : [];
+
+  console.log("rawBonus");
+  console.log(rawBonus);
 
   // Keep only codes that exist in the CSV-driven pool
   const stack = rawStack.filter(code => !!effByCode[code]);
+  console.log("stack");
+  console.log(stack);
+
   const bonuses = rawBonus.filter(code => !!bonByCode[code]);
+  console.log("bonuses");
+  console.log(bonuses);
+
 
   // Enforce exactly one base effect
   const baseCodes = stack.filter(code => isBaseEffect(effByCode[code]));
+  console.log("baseCodes");
+  console.log(baseCodes);
+
   if (baseCodes.length === 0){
     return { ok:false, error:'no_base_effect', message:'Your stack must include exactly one base-eligible effect (see mg_effects.base_flag_eligible).' };
   }
