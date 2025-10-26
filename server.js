@@ -138,60 +138,31 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
   );
 
   const rawStack = Array.isArray(inputStack) ? inputStack.map(x => String(x).trim()) : [];
-  
-  console.log("rawStack");
-  console.log(rawStack);
-  
+
   const rawBonus = Array.isArray(inputBonuses) ? inputBonuses.map(x => String(x).trim()) : [];
 
-  console.log("rawBonus");
-  console.log(rawBonus);
-
-  // Keep only codes that exist in the CSV-driven pool
-  //const stack = rawStack.filter(code => !!effByCode[code]);
+  // Keep only codes that exist in the database
   const stack = rawStack.filter(code =>
     effByCode.some(e => e.code === code)
   );
-  console.log("stack");
-  console.log(stack);
 
-  const bonuses = rawBonus.filter(code => !!bonByCode[code]);
-  console.log("bonuses");
-  console.log(bonuses);
-
+  //const bonuses = rawBonus.filter(code => !!bonByCode[code]);
+  const bonuses = rawBonus.filter(code =>
+    bonByCode.some(e => e.code === code)
+  );
 
   // Enforce exactly one base effect
   const baseCodes = stack.filter(code =>
     effByCode.some(e => e.code === code && e.base_flag_eligible)
   );
 
-  console.log("baseCodes");
-  console.log(baseCodes);
-
   if (baseCodes.length != 1){
     return { ok:false, error:'not one base effect', message:'Your stack must include exactly one base-eligible effect (see mg_effects.base_flag_eligible).' };
   }
   const baseKeep = baseCodes[0];
-  console.log("baseKeep");
-  console.log(baseKeep);
 
   const filtered = [];
   let basePlaced = false;
-
-  // for (const code of stack){
-  //   const isBase = isBaseEffect(effByCode[code]);
-  //   if (isBase){
-  //     if (basePlaced){
-  //       // skip any extra base effects
-  //       continue;
-  //     }
-  //     if (code !== baseKeep) continue; // only allow the first-found base
-  //     filtered.push(code);
-  //     basePlaced = true;
-  //   } else {
-  //     filtered.push(code);
-  //   }
-  // }
 
   // Guarantee the base is first in the stack (helps downstream resolver)
   if (stack[0] !== baseKeep){
@@ -199,10 +170,7 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
     stack.length = 0;
     stack.push(baseKeep, ...withoutBase);
   }
-  console.log("stack");
-  console.log(stack);
-  console.log("bonuses");
-  console.log(bonuses);
+
   const returnOk = true;
 
 
@@ -336,7 +304,7 @@ async function syncMonsterLearnedFromMoves(monId){
   console.log(effectCodes);
   console.log("bonusCodes");
   console.log(bonusCodes);
-  
+
   // Add to learned_pool at 100, remove from learn_list if present
   for (const code of effectCodes){
     //learnedPool.effects[code] = 100;
@@ -1410,13 +1378,18 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
 
     // --- Validate & sanitize against database
-    const result = validateAndSanitizeStack(stack, bonuses);
+    try {
+      const result = validateAndSanitizeStack(stack, bonuses);
+    }catch(err) {
+      console.error('monster/move error:', err);
+    };
+    
     console.log("result");
     console.log(result);
     if (!result.ok){
       return res.status(400).json({ error: result.error, message: result.message });
     }
-    
+
 
     const newStack   = result.stack;
     const newBonuses = result.bonuses;
