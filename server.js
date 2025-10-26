@@ -199,8 +199,10 @@ async function validateAndSanitizeStack(inputStack, inputBonuses){
     stack.length = 0;
     stack.push(baseKeep, ...withoutBase);
   }
+  console.log("stack");
+  console.log(stack);
 
-  return { ok:true, stack: filtered, bonuses };
+  return { ok:true, stack, bonuses };
 }
 
 // --- Per-effect resolver helpers (accuracy & PP from base effect) ---
