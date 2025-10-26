@@ -1406,7 +1406,7 @@ app.post('/api/monster/move', auth, async (req,res)=>{
     if (idx < 0 || idx >= moves.length) return res.status(400).json({ error:'bad_index' });
 
     // --- Validate & sanitize against database
-    const result = validateAndSanitizeStack(stack, bonuses
+    const result = validateAndSanitizeStack(stack, bonuses);
     console.log("result");
     console.log(result);
     if (!result.ok){
